@@ -1,0 +1,99 @@
+SMN hourly weather email — setup
+================================
+
+Configuration (pick one or combine: env overrides file)
+
+1) config.properties (recommended)
+   Copy config.example.properties to config.properties in the project directory (same folder as run.sh).
+   Fill mail.smtp.*, mail.from, and mail.to (comma-separated addresses).
+   config.properties is gitignored — do not commit secrets.
+
+2) Environment variables still override the file when set (MAIL_SMTP_HOST, MAIL_SMTP_USER, etc.).
+
+3) Optional: SMN_CONFIG_FILE=/absolute/or/relative/path/to.properties
+
+Run (builds then starts):
+  ./run.sh
+
+Requires either complete MAIL_* (or GMAIL_*) in the environment, or a readable config file with
+mail.smtp.host, mail.smtp.user, mail.smtp.password, mail.from, and mail.to.
+
+Or manually:
+  mvn package
+  java -cp "target/smn-weather-mail-1.0.0.jar:target/lib/*" ar.gob.smn.weather.WeatherMailApplication
+
+SMTP (file keys → same as env):
+  mail.smtp.host      → MAIL_SMTP_HOST
+  mail.smtp.user      → MAIL_SMTP_USER
+  mail.smtp.password  → MAIL_SMTP_PASSWORD (env value is always plaintext)
+  mail.from           → MAIL_FROM
+  mail.to             → MAIL_TO (comma-separated list; all in To:)
+
+Telegram (optional — duplicates each weather email as a Telegram message):
+  telegram.bot.token  → TELEGRAM_BOT_TOKEN (from @BotFather)
+  telegram.chat.ids   → TELEGRAM_CHAT_IDS (comma-separated numeric ids, e.g. 332253693)
+  If the token is unset, Telegram is disabled. Open a chat with your bot and press Start so it can message you.
+  Token must look like 123456789:AAH… — do not add the word "bot" before it (that causes HTTP 404).
+  chat_id must be your user id (or a group id), not another bot. If you see "bots can't send messages to bots",
+  the id you configured belongs to a bot — use @userinfobot or getUpdates after messaging your own bot.
+
+Encrypted SMTP password in the file:
+  - Set mail.smtp.password=ENC1:... (AES-256-GCM + PBKDF2; random salt per encryption).
+  - At runtime set SMN_MASTER_PASSWORD to the same passphrase you used when encrypting.
+  - MAIL_SMTP_PASSWORD in the environment overrides the file and is never treated as ENC1.
+  - Generate a value (after mvn package):
+      SMN_MASTER_PASSWORD='your-passphrase' java -cp "target/smn-weather-mail-1.0.0.jar:target/lib/*" \
+        ar.gob.smn.weather.ConfigCryptoCli encrypt 'plaintext-smtp-key'
+    Paste the printed ENC1:... line into config.properties.
+
+Optional (file or env):
+  MAIL_SMTP_PORT      default 587 (STARTTLS). Use 465 for implicit SSL with most providers.
+  MAIL_SMTP_STARTTLS  true/false (default true on port 587; ignored if SSL)
+  MAIL_SMTP_SSL       true to force SSL socket factory (also auto when port is 465)
+  SMN_SENT_LOG_FILE   Path to the dedupe log (default: ./smn-weather-sent.txt). One line per sent
+                      snapshot: locationId|instant (UTC). Delete or edit the file to allow resends.
+  SMN_MEASURES_DIR    Root folder for appended measures (default: ./smn-measures). Layout:
+                      <dir>/<yyyy>/<MM>/<yyyy-MM-dd>.txt — year folder, month subfolder, one file per day
+                      (Buenos Aires date). Rows use fixed-width columns (open in a monospace font for alignment).
+                      Header + rule line are written when the day file is first created.
+
+Legacy aliases (env only, same values as MAIL_*):
+  GMAIL_SMTP_HOST, GMAIL_SMTP_USER, GMAIL_SMTP_PASSWORD, GMAIL_SMTP_PORT
+
+Brevo (typical):
+  Host smtp-relay.brevo.com, port 587, SMTP login + SMTP key from Settings → SMTP & API.
+
+Other providers (typical):
+  - SendGrid: smtp.sendgrid.net, user "apikey", password = API key.
+  - Mailgun:  smtp.mailgun.org, port 587
+  - SES:      email-smtp.<region>.amazonaws.com
+
+Corporate Maven / PKIX error on internal Nexus:
+  run.sh uses maven-settings-public.xml so this build does not use ~/.m2/settings.xml
+  mirrors. Override with: MVN_SETTINGS=/path/to/settings.xml ./run.sh
+  If it still fails, your MAVEN_HOME/conf/settings.xml may define a mirror; use a
+  Maven install without that, or fix the corporate cert in the JVM truststore.
+
+Behaviour:
+  - Polls SMN every 2 minutes, but skips a station until the next clock hour (ART) once an observation
+    for that hour has already been mailed (fewer requests while waiting for the next bulletin).
+  - Waits 10 seconds between each configured station in a round (before the next station), to reduce
+    burst traffic to SMN.
+  - Emails only when the JSON field "date" (observation time) changes. SMN often publishes the next
+    hour’s bulletin several minutes after the clock (e.g. still 12:00 ART in the API at 13:05). That is
+    normal; there is no separate mail until SMN updates "date" to the new hour.
+  - When a station has a new observation (not already listed in the sent log), sends one email
+    (same body) to every address in mail.to / MAIL_TO, and the same subject + body to each Telegram
+    chat id if telegram.bot.token is configured. The other station triggers another message when its data updates.
+  - Appends each mailed snapshot to smn-weather-sent.txt (locationId|UTC instant) so the same
+    observation is never emailed twice, including after restart.
+  - Appends the same snapshot as an aligned row under smn-measures/<yyyy>/<MM>/<yyyy-MM-dd>.txt
+    (Buenos Aires calendar day). If writing measures fails, a warning is logged; the email still counts as sent.
+
+Stations (env SMN_LOCATION_IDS):
+  - Default: 4864 (CABA) and 10821 (Aeroparque Buenos Aires), comma-separated.
+  - CABA only: export SMN_LOCATION_IDS=4864
+  - If location 10821 often returns HTTP 401, SMN is blocking that endpoint for your IP/client;
+    CABA-only avoids it. The app uses browser-like headers to reduce 401s when possible.
+
+Change recipients: mail.to in config.properties or MAIL_TO env.

@@ -1,0 +1,9 @@
+config.properties
+smn-weather-sent.txt
+smn-measures/
+target/
+.idea/
+*.iml
+.classpath
+.project
+.settings/
