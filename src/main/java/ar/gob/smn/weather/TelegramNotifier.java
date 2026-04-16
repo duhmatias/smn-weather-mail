@@ -29,17 +29,37 @@ final class TelegramNotifier {
     }
 
     void sendWeatherMessage(String emailSubject, String emailBody) throws IOException, InterruptedException {
-        String text = emailSubject + "\n\n" + emailBody;
+        sendPlainText(emailSubject + "\n\n" + emailBody);
+    }
+
+    /** Single body (e.g. formatted forecast) without subject/body pairing. */
+    void sendPlainText(String text) throws IOException, InterruptedException {
         if (text.length() > TELEGRAM_TEXT_LIMIT) {
             text = text.substring(0, TELEGRAM_TEXT_LIMIT - 3) + "...";
         }
         for (String chatId : chatIds) {
-            sendToChat(chatId.trim(), text);
+            sendToChat(chatId.trim(), text, false);
         }
     }
 
-    private void sendToChat(String chatId, String text) throws IOException, InterruptedException {
-        String form = "chat_id=" + enc(chatId) + "&text=" + enc(text) + "&disable_web_page_preview=true";
+    /** {@code parse_mode=HTML} — caller must escape dynamic text (e.g. {@code &lt;} for {@code <}). */
+    void sendHtml(String html) throws IOException, InterruptedException {
+        if (html.length() > TELEGRAM_TEXT_LIMIT) {
+            html = html.substring(0, TELEGRAM_TEXT_LIMIT - 3) + "...";
+        }
+        for (String chatId : chatIds) {
+            sendToChat(chatId.trim(), html, true);
+        }
+    }
+
+    private void sendToChat(String chatId, String text, boolean html) throws IOException, InterruptedException {
+        String form =
+                "chat_id="
+                        + enc(chatId)
+                        + "&text="
+                        + enc(text)
+                        + (html ? "&parse_mode=HTML" : "")
+                        + "&disable_web_page_preview=true";
         URI uri = telegramMethodUri("sendMessage");
         HttpRequest req = HttpRequest.newBuilder(uri)
                 .header("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
@@ -69,6 +89,22 @@ final class TelegramNotifier {
                     "Telegram HTTP 403: bot cannot message this chat (wrong chat_id, user blocked the bot, "
                             + "or user never pressed Start). Response: "
                             + b);
+        }
+        if (res.statusCode() == 400) {
+            String b = res.body() != null ? res.body() : "";
+            if (b.contains("chat not found")) {
+                throw new IOException(
+                        "Telegram HTTP 400 (chat not found) for chat_id="
+                                + chatId
+                                + ". That id is invalid for this bot, or no conversation exists yet. "
+                                + "Fix: open this bot in Telegram from the account or group you want, press Start "
+                                + "(or add the bot to the group), then set chat id from "
+                                + "https://api.telegram.org/bot<token>/getUpdates (look at message.chat.id). "
+                                + "Groups/supergroups/channels often use negative ids. API response: "
+                                + b);
+            }
+            throw new IOException(
+                    "Telegram HTTP 400 (bad request) for chat_id=" + chatId + ": " + b);
         }
         if (res.statusCode() != 200) {
             throw new IOException("Telegram HTTP " + res.statusCode() + ": " + res.body());

@@ -139,8 +139,77 @@ final class SmnClient {
         return fetch(station);
     }
 
+    /**
+     * Short-term forecast for the same {@link Station} ({@code /v1/forecast/location/{id}}), plain text for email bodies.
+     */
+    String fetchForecastPlainText(Station station) throws IOException, InterruptedException {
+        return fetchForecastPayload(station).plainText();
+    }
+
+    /** Forecast JSON as plain text plus {@code updated} for deduplication. */
+    static final class ForecastPayload {
+        private final String updated;
+        private final String plainText;
+        private final String telegramText;
+        private final String telegramHtml;
+        /** Raw JSON from {@code /v1/forecast/location/…} for slicing (e.g. single-day combined email/Telegram). */
+        private final String forecastJson;
+
+        ForecastPayload(
+                String updated,
+                String plainText,
+                String telegramText,
+                String telegramHtml,
+                String forecastJson) {
+            this.updated = updated;
+            this.plainText = plainText;
+            this.telegramText = telegramText;
+            this.telegramHtml = telegramHtml;
+            this.forecastJson = forecastJson;
+        }
+
+        String updated() {
+            return updated;
+        }
+
+        String plainText() {
+            return plainText;
+        }
+
+        /** Plain bulletin for logs and non-HTML consumers; headline uses {@code STATION/TAG}. */
+        String telegramText() {
+            return telegramText;
+        }
+
+        /** Full forecast as Telegram HTML ({@code parse_mode=HTML}). */
+        String telegramHtml() {
+            return telegramHtml;
+        }
+
+        String forecastJson() {
+            return forecastJson;
+        }
+    }
+
+    ForecastPayload fetchForecastPayload(Station station) throws IOException, InterruptedException {
+        String url = "https://ws1.smn.gob.ar/v1/forecast/location/" + station.locationId();
+        HttpResponse<String> res = smnGet(url);
+        String body = res.body();
+        String updated = ForecastFormatter.parseUpdated(body);
+        String plain = ForecastFormatter.format(body);
+        String headline = TelegramForecastFormatter.smnLocationHeadline(station);
+        String telegram = TelegramForecastFormatter.format(body, headline);
+        String telegramHtml = TelegramForecastFormatter.formatTelegramHtml(body, headline);
+        return new ForecastPayload(updated, plain, telegram, telegramHtml, body);
+    }
+
     private Observation fetch(Station station) throws IOException, InterruptedException {
         String url = "https://ws1.smn.gob.ar/v1/weather/location/" + station.locationId();
+        HttpResponse<String> res = smnGet(url);
+        return parse(res.body(), station.label());
+    }
+
+    private HttpResponse<String> smnGet(String url) throws IOException, InterruptedException {
         HttpRequest req = HttpRequest.newBuilder(URI.create(url))
                 .header("User-Agent", USER_AGENT)
                 .header("Accept", "application/json, text/plain, */*")
@@ -154,14 +223,12 @@ final class SmnClient {
                 .build();
         HttpResponse<String> res = http.send(req, HttpResponse.BodyHandlers.ofString());
         if (res.statusCode() == 401) {
-            throw new IOException("SMN HTTP 401 for location " + station.locationId()
-                    + " (Aeroparque 10821 is often restricted). Use SMN_LOCATION_IDS=4864 or try again later. Body: "
-                    + res.body());
+            throw new IOException("SMN HTTP 401 for " + url + " — try SMN_LOCATION_IDS=4864 or later. Body: " + res.body());
         }
         if (res.statusCode() != 200) {
             throw new IOException("SMN HTTP " + res.statusCode() + " for " + url + ": " + res.body());
         }
-        return parse(res.body(), station.label());
+        return res;
     }
 
     private Observation parse(String body, String fallbackName) throws IOException {

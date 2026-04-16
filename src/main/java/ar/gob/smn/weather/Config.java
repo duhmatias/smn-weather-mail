@@ -24,6 +24,13 @@ final class Config {
     private final List<String> recipients;
     /** Nullable: when set, weather is also sent to these Telegram chats. */
     private final Telegram telegram;
+    /**
+     * Nullable forecast routing: either a different bot token + chats, or same token with different chat ids.
+     * When {@code null}, {@link #telegramForForecast()} uses {@link #telegram()}.
+     */
+    private final Telegram telegramForecastConfig;
+    /** Nullable: {@code SMN_REPORT_HOST} / {@code smn.report.host} for message footer; else OS hostname. */
+    private final String reportHostLabel;
 
     private Config(
             String smtpHost,
@@ -34,7 +41,9 @@ final class Config {
             boolean smtpStartTls,
             boolean smtpSsl,
             List<String> recipients,
-            Telegram telegram) {
+            Telegram telegram,
+            Telegram telegramForecastConfig,
+            String reportHostLabel) {
         this.smtpHost = smtpHost;
         this.smtpPort = smtpPort;
         this.smtpUser = smtpUser;
@@ -44,6 +53,8 @@ final class Config {
         this.smtpSsl = smtpSsl;
         this.recipients = recipients;
         this.telegram = telegram;
+        this.telegramForecastConfig = telegramForecastConfig;
+        this.reportHostLabel = reportHostLabel;
     }
 
     /** Optional Telegram mirror; {@code null} if {@code telegram.bot.token} / {@code TELEGRAM_BOT_TOKEN} unset. */
@@ -120,8 +131,66 @@ final class Config {
 
         List<String> recipients = parseRecipients(fileProps);
         Telegram telegram = parseTelegram(fileProps);
+        Telegram telegramForecastConfig = parseForecastTelegram(fileProps, telegram);
 
-        return new Config(host, port, user, password, from, startTls, ssl, recipients, telegram);
+        String reportHost = firstNonBlank(System.getenv("SMN_REPORT_HOST"), null, fileProps, "smn.report.host");
+        if (reportHost != null) {
+            reportHost = reportHost.trim();
+            if (reportHost.isEmpty()) {
+                reportHost = null;
+            }
+        }
+
+        return new Config(host, port, user, password, from, startTls, ssl, recipients, telegram, telegramForecastConfig, reportHost);
+    }
+
+    /**
+     * Forecast bulletins: optional {@code telegram.forecast.bot.token} / {@code TELEGRAM_FORECAST_BOT_TOKEN}
+     * with {@code telegram.forecast.chat.ids}, or same bot as {@link #telegram()} with only different chat ids.
+     */
+    private static Telegram parseForecastTelegram(Properties fileProps, Telegram main) {
+        if (main == null) {
+            return null;
+        }
+        String forecastToken =
+                firstNonBlank(System.getenv("TELEGRAM_FORECAST_BOT_TOKEN"), null, fileProps, "telegram.forecast.bot.token");
+        String forecastChats =
+                firstNonBlank(System.getenv("TELEGRAM_FORECAST_CHAT_IDS"), null, fileProps, "telegram.forecast.chat.ids");
+
+        if (forecastToken != null && !forecastToken.isBlank()) {
+            forecastToken = normalizeTelegramBotToken(forecastToken.trim());
+            if (forecastChats == null || forecastChats.isBlank()) {
+                throw new IllegalStateException(
+                        "telegram.forecast.bot.token / TELEGRAM_FORECAST_BOT_TOKEN is set; add telegram.forecast.chat.ids "
+                                + "(recipient user or group id(s) — not the bot's id from the token) or TELEGRAM_FORECAST_CHAT_IDS.");
+            }
+            List<String> ids = splitCommaIds(forecastChats);
+            if (ids.isEmpty()) {
+                throw new IllegalStateException("telegram.forecast.chat.ids must list at least one chat id.");
+            }
+            return new Telegram(forecastToken, Collections.unmodifiableList(ids));
+        }
+
+        if (forecastChats != null && !forecastChats.isBlank()) {
+            List<String> ids = splitCommaIds(forecastChats);
+            if (ids.isEmpty()) {
+                return null;
+            }
+            return new Telegram(main.botToken(), Collections.unmodifiableList(ids));
+        }
+
+        return null;
+    }
+
+    private static List<String> splitCommaIds(String raw) {
+        List<String> ids = new ArrayList<>();
+        for (String part : raw.split(",")) {
+            String s = part.trim();
+            if (!s.isEmpty()) {
+                ids.add(s);
+            }
+        }
+        return ids;
     }
 
     private static Telegram parseTelegram(Properties fileProps) {
@@ -276,6 +345,24 @@ final class Config {
         return telegram;
     }
 
+    /**
+     * Bot + chats for forecast bulletin Telegram sends. When no forecast-specific config exists, returns
+     * {@link #telegram()}.
+     */
+    Telegram telegramForForecast() {
+        return telegramForecastConfig != null ? telegramForecastConfig : telegram;
+    }
+
+    /** Nullable when forecast uses the same token and chats as current conditions. */
+    Telegram telegramForecastConfig() {
+        return telegramForecastConfig;
+    }
+
+    /** Nullable explicit label for {@code (host)} footer in condition messages. */
+    String reportHostLabel() {
+        return reportHostLabel;
+    }
+
     String smtpHost() {
         return smtpHost;
     }
@@ -310,6 +397,10 @@ final class Config {
                 + ", smtpUser='" + smtpUser + "', fromAddress='" + fromAddress + "'"
                 + ", recipients=" + recipients.size()
                 + ", telegram=" + (telegram != null ? "on(" + telegram.chatIds().size() + " chats)" : "off")
+                + ", forecast="
+                + (telegram != null && telegramForecastConfig != null
+                        ? (telegramForecastConfig.botToken().equals(telegram.botToken()) ? "otherChats" : "otherBot")
+                        : "same")
                 + "}";
     }
 }

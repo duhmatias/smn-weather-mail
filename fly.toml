@@ -1,0 +1,26 @@
+# Fly.io — deploy from GitHub: connect repo in dashboard or `fly deploy` from CI.
+# Rename `app` if the name is taken (globally unique on Fly).
+
+app = "smn-weather-mail"
+primary_region = "gru"
+
+[build]
+  dockerfile = "Dockerfile"
+
+# Dedupe log + measures + forecast history on a persistent volume (see [mounts]).
+[env]
+  SMN_SENT_LOG_FILE = "/data/smn-weather-sent.txt"
+  SMN_MEASURES_DIR = "/data/smn-measures"
+  SMN_FORECAST_HISTORY_DIR = "/data/smn-forecast-history"
+
+# No [http_service]: this process only polls SMN and sends email/Telegram (not a web server).
+
+[[vm]]
+  cpus = 1
+  cpu_kind = "shared"
+  memory = "512mb"
+
+[mounts]
+  source = "smn_data"
+  destination = "/data"
+  initial_size = "1gb"

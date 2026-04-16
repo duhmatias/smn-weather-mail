@@ -32,10 +32,20 @@ SMTP (file keys → same as env):
 Telegram (optional — duplicates each weather email as a Telegram message):
   telegram.bot.token  → TELEGRAM_BOT_TOKEN (from @BotFather)
   telegram.chat.ids   → TELEGRAM_CHAT_IDS (comma-separated numeric ids, e.g. 332253693)
+  telegram.forecast.chat.ids → TELEGRAM_FORECAST_CHAT_IDS (optional). Forecast-only chats: either with the same
+                      bot token as telegram.bot.token, or together with telegram.forecast.bot.token /
+                      TELEGRAM_FORECAST_BOT_TOKEN for a second bot. When unset, forecast uses the same bot + chats
+                      as current conditions.
+  telegram.forecast.bot.token → TELEGRAM_FORECAST_BOT_TOKEN (optional). Second bot for forecast bulletins only;
+                      must set telegram.forecast.chat.ids to recipient id(s) (your user id or group — not the
+                      number before ":" in the token).
   If the token is unset, Telegram is disabled. Open a chat with your bot and press Start so it can message you.
   Token must look like 123456789:AAH… — do not add the word "bot" before it (that causes HTTP 404).
   chat_id must be your user id (or a group id), not another bot. If you see "bots can't send messages to bots",
   the id you configured belongs to a bot — use @userinfobot or getUpdates after messaging your own bot.
+  HTTP 400 "chat not found": the id is wrong for this bot, or that user/group never opened the bot (press Start)
+  in Telegram first). Confirm chat id with GET https://api.telegram.org/bot<token>/getUpdates after sending any
+  message to the bot; groups/channels often use negative chat ids.
 
 Encrypted SMTP password in the file:
   - Set mail.smtp.password=ENC1:... (AES-256-GCM + PBKDF2; random salt per encryption).
@@ -56,6 +66,10 @@ Optional (file or env):
                       <dir>/<yyyy>/<MM>/<yyyy-MM-dd>.txt — year folder, month subfolder, one file per day
                       (Buenos Aires date). Rows use fixed-width columns (open in a monospace font for alignment).
                       Header + rule line are written when the day file is first created.
+  SMN_FORECAST_HISTORY_DIR
+                      Same layout as SMN_MEASURES_DIR (default: ./smn-forecast-history). Appends one row per
+                      CABA forecast snapshot: observation emails (OBS_EMAIL) and morning/evening Telegram
+                      bulletins (TG_MORNING / TG_EVENING), with smn_updated, host, and a one-line snippet.
 
 Legacy aliases (env only, same values as MAIL_*):
   GMAIL_SMTP_HOST, GMAIL_SMTP_USER, GMAIL_SMTP_PASSWORD, GMAIL_SMTP_PORT
@@ -97,3 +111,38 @@ Stations (env SMN_LOCATION_IDS):
     CABA-only avoids it. The app uses browser-like headers to reduce 401s when possible.
 
 Change recipients: mail.to in config.properties or MAIL_TO env.
+
+Deploy on Fly.io (build and run in the cloud, not on your Mac)
+-----------------------------------------------------------
+Prerequisites: [flyctl](https://fly.io/docs/hands-on/install-flyctl/), GitHub repo pushed, Fly account.
+
+1) Create the app (once), same name as in fly.toml or edit `app =` first:
+     fly apps create smn-weather-mail
+   If the name is taken, change `app` in fly.toml and use that name here.
+
+2) Set secrets (SMTP, Telegram, encryption, etc. — same variables as local env):
+     fly secrets set \
+       MAIL_SMTP_HOST=smtp-relay.brevo.com \
+       MAIL_SMTP_USER=... \
+       MAIL_SMTP_PASSWORD=... \
+       MAIL_FROM=... \
+       MAIL_TO=you@example.com \
+       SMN_MASTER_PASSWORD=... \
+       TELEGRAM_BOT_TOKEN=... \
+       TELEGRAM_CHAT_IDS=...
+   Add any other env your setup needs (e.g. SMN_LOCATION_IDS).
+
+3) Deploy (builds the Docker image on Fly and starts a Machine):
+     cd /path/to/smn-weather-mail
+     fly deploy
+
+   First deploy creates the volume `smn_data` (see `initial_size` in fly.toml) if it does not exist.
+
+4) Logs and status:
+     fly logs
+     fly status
+
+5) GitHub: in the Fly dashboard you can connect the repo for automatic deploys on push; or run `fly deploy`
+   manually / from CI using a [deploy token](https://fly.io/docs/security/tokens/).
+
+Do not commit secrets. Use only `fly secrets` and `config.example.properties` patterns in git.

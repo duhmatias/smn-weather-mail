@@ -51,7 +51,7 @@ final class MailSender {
         msg.setFrom(new InternetAddress(config.fromAddress()));
         msg.setRecipients(Message.RecipientType.TO, recipients);
         msg.setSubject(subject, "UTF-8");
-        msg.setText(textBody, "UTF-8");
+        msg.setContent(textBody, "text/html; charset=UTF-8");
 
         String mode = config.smtpSsl() ? "SSL" : (config.smtpStartTls() ? "STARTTLS" : "plain");
         LOG.info(() -> "Sending mail via " + config.smtpHost() + ":" + config.smtpPort()
