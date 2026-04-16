@@ -24,8 +24,8 @@ import java.util.logging.Logger;
  * Polls SMN on an interval; when a station reports a new observation (not yet recorded in the
  * sent log), emails that station alone. Each distinct observation time per location is mailed at most once.
  * Stations are not polled while the current Buenos Aires clock hour already has a mailed observation
- * for that location. While the clock hour has no mailed bulletin yet, sleep is 2 minutes through minute 9
- * and 5 minutes from minute 10 until SMN publishes the new hour (or the next hour begins).
+ * for that location. While the clock hour has no mailed bulletin yet, sleep is 2 minutes through minute 19
+ * and 5 minutes from minute 20 until SMN publishes the new hour (or the next hour begins).
  */
 public final class WeatherMailApplication {
 
@@ -33,9 +33,9 @@ public final class WeatherMailApplication {
 
     private static final ZoneId BUENOS_AIRES = ZoneId.of("America/Argentina/Buenos_Aires");
     private static final Duration POLL_INTERVAL = Duration.ofMinutes(2);
-    /** While the current ART clock hour has no mailed bulletin yet: sleep this long from :00 through :09. */
+    /** While the current ART clock hour has no mailed bulletin yet: sleep this long from :00 through :19. */
     private static final Duration POLL_STALE_EARLY = Duration.ofMinutes(2);
-    /** Same situation from minute 10 until SMN catches up: slower cadence. */
+    /** Same situation from minute 20 until SMN catches up: slower cadence. */
     private static final Duration POLL_STALE_LATE = Duration.ofMinutes(5);
     /** While in the CABA forecast Telegram window and SMN has not yet published a new {@code updated}, poll faster. */
     private static final Duration FORECAST_POLL_ACTIVE = Duration.ofMinutes(1);
@@ -59,9 +59,6 @@ public final class WeatherMailApplication {
     private static final Map<Integer, String> KNOWN_STATION_NAMES = Map.of(
             4864, "Ciudad Autónoma de Buenos Aires",
             10821, "Aeroparque Buenos Aires");
-
-    /** Throttle "SMN still on previous hour" logs per location id. */
-    private static final Map<Integer, Long> lastStaleDedupeLogAtMs = new HashMap<>();
 
     public static void main(String[] args) throws Exception {
         Config config = Config.load();
@@ -91,7 +88,7 @@ public final class WeatherMailApplication {
         LOG.info(() -> "Measures dir: " + measuresDir.toAbsolutePath() + " (YYYY/MM/<day>.txt)");
         LOG.info(() -> "Forecast history dir: " + forecastHistoryDir.toAbsolutePath() + " (YYYY/MM/<day>.txt)");
         LOG.info(() -> "Recipients: " + config.recipients() + " | zone: " + BUENOS_AIRES + " | poll: " + POLL_INTERVAL
-                + " (2m to :09, 5m from :10 if hourly bulletin still pending) | pause between stations: "
+                + " (2m through :19, 5m from :20 if hourly bulletin still pending) | pause between stations: "
                 + SLEEP_BETWEEN_STATIONS);
         if (telegramConditions != null) {
             LOG.info(() -> "Telegram (conditions): " + config.telegram().chatIds().size() + " chat(s)");
@@ -125,7 +122,7 @@ public final class WeatherMailApplication {
                     Instant instant = o.observationTime().toInstant();
                     String key = SentWeatherLog.key(station.locationId(), instant);
                     if (sent.contains(key)) {
-                        logIfStaleDedupeSkip(station, o);
+                        logConditionsCheckedNotUpdatedYet(station, o);
                         sleepBetweenStationsIfNeeded(i, stations.size());
                         continue;
                     }
@@ -206,35 +203,66 @@ public final class WeatherMailApplication {
             boolean fastForecastPoll =
                     trySendCabaForecastTelegram(
                             smn, telegramForecast, forecastSent, configIncludesCaba, forecastHistory, reportHost);
-            Thread.sleep(pollSleepMillis(fastForecastPoll, stations, lastMailedObsHourArt));
+            Thread.sleep(PollCadence.resolve(fastForecastPoll, stations, lastMailedObsHourArt).sleepMillis());
         }
     }
 
     /**
-     * Forecast window uses 1m. Otherwise, if any station still needs a bulletin for the current ART clock hour,
-     * use 2m until minute 10 then 5m. Otherwise default 2m between full poll cycles.
+     * Cadence between full poll cycles (all stations + optional forecast round). Explicit states replace nested
+     * conditionals for the “hourly bulletin not in yet” window in ART.
      */
-    private static long pollSleepMillis(
-            boolean fastForecastPoll,
-            List<SmnClient.Station> stations,
-            Map<Integer, ZonedDateTime> lastMailedObsHourArt) {
-        if (fastForecastPoll) {
-            return FORECAST_POLL_ACTIVE.toMillis();
+    private enum PollCadence {
+        /** CABA forecast morning/evening window: poll every minute until SMN publishes a new {@code updated}. */
+        FORECAST_WINDOW(FORECAST_POLL_ACTIVE),
+        /**
+         * At least one station still needs a mailed observation for the current ART clock hour; local minute is
+         * 0–19 → poll every 2 minutes.
+         */
+        WAITING_BULLETIN_EARLY_ART(POLL_STALE_EARLY),
+        /**
+         * Same as {@link #WAITING_BULLETIN_EARLY_ART} but from minute 20 until SMN catches up → poll every 5 minutes.
+         */
+        WAITING_BULLETIN_LATE_ART(POLL_STALE_LATE),
+        /** All stations have this hour’s bulletin on file, or we are not waiting on the clock hour. */
+        STEADY(POLL_INTERVAL);
+
+        private final Duration sleep;
+
+        PollCadence(Duration sleep) {
+            this.sleep = sleep;
         }
-        ZonedDateTime nowArt = ZonedDateTime.now(BUENOS_AIRES);
-        ZonedDateTime nowHourArt = nowArt.truncatedTo(ChronoUnit.HOURS);
-        boolean oweThisClockHour = false;
-        for (SmnClient.Station s : stations) {
-            ZonedDateTime mailed = lastMailedObsHourArt.get(s.locationId());
-            if (mailed == null || !mailed.equals(nowHourArt)) {
-                oweThisClockHour = true;
-                break;
+
+        long sleepMillis() {
+            return sleep.toMillis();
+        }
+
+        static PollCadence resolve(
+                boolean fastForecastPoll,
+                List<SmnClient.Station> stations,
+                Map<Integer, ZonedDateTime> lastMailedObsHourArt) {
+            if (fastForecastPoll) {
+                return FORECAST_WINDOW;
             }
+            ZonedDateTime nowArt = ZonedDateTime.now(BUENOS_AIRES);
+            ZonedDateTime nowHourArt = nowArt.truncatedTo(ChronoUnit.HOURS);
+            if (!owesThisClockHour(stations, lastMailedObsHourArt, nowHourArt)) {
+                return STEADY;
+            }
+            return nowArt.getMinute() < 20 ? WAITING_BULLETIN_EARLY_ART : WAITING_BULLETIN_LATE_ART;
         }
-        if (oweThisClockHour) {
-            return nowArt.getMinute() < 10 ? POLL_STALE_EARLY.toMillis() : POLL_STALE_LATE.toMillis();
+
+        private static boolean owesThisClockHour(
+                List<SmnClient.Station> stations,
+                Map<Integer, ZonedDateTime> lastMailedObsHourArt,
+                ZonedDateTime nowHourArt) {
+            for (SmnClient.Station s : stations) {
+                ZonedDateTime mailed = lastMailedObsHourArt.get(s.locationId());
+                if (mailed == null || !mailed.equals(nowHourArt)) {
+                    return true;
+                }
+            }
+            return false;
         }
-        return POLL_INTERVAL.toMillis();
     }
 
     /** Full HTML bulletin + host line (no {@code pre}); bulletin already uses allowed Telegram HTML tags. */
@@ -519,28 +547,19 @@ public final class WeatherMailApplication {
     }
 
     /**
-     * SMN often keeps the same {@code date} in JSON until the next synoptic bulletin is published, which can
-     * lag wall-clock (e.g. still 12:00 ART after 13:00). We already mailed that snapshot; explain in logs.
+     * Logs every poll where SMN returned an observation we already sent (waiting for {@code date} / instant to
+     * advance before mailing again).
      */
-    private static void logIfStaleDedupeSkip(SmnClient.Station station, SmnClient.Observation o) {
-        ZonedDateTime obsHour =
-                o.observationTime().withZoneSameInstant(BUENOS_AIRES).truncatedTo(ChronoUnit.HOURS);
-        ZonedDateTime nowHour = ZonedDateTime.now(BUENOS_AIRES).truncatedTo(ChronoUnit.HOURS);
-        if (!nowHour.isAfter(obsHour)) {
-            return;
-        }
-        long ms = System.currentTimeMillis();
-        synchronized (lastStaleDedupeLogAtMs) {
-            long prev = lastStaleDedupeLogAtMs.getOrDefault(station.locationId(), 0L);
-            if (ms - prev < Duration.ofMinutes(20).toMillis()) {
-                return;
-            }
-            lastStaleDedupeLogAtMs.put(station.locationId(), ms);
-        }
-        LOG.info(() -> "No new email for " + station.label()
-                + ": API observation is still " + obsHour + " ART while local time is " + nowHour
-                + " ART. SMN usually updates the hour after the bulletin; the next send happens when "
-                + "\"date\" in the JSON advances.");
+    private static void logConditionsCheckedNotUpdatedYet(SmnClient.Station station, SmnClient.Observation o) {
+        ZonedDateTime obsArt = o.observationTime().withZoneSameInstant(BUENOS_AIRES);
+        ZonedDateTime nowArt = ZonedDateTime.now(BUENOS_AIRES);
+        LOG.info(() -> "Conditions check: "
+                + station.label()
+                + " — SMN observation still "
+                + obsArt
+                + " (not updated yet); local "
+                + nowArt
+                + " ART. Next send when JSON \"date\" advances.");
     }
 
     private static String subjectFor(SmnClient.Observation o) {
