@@ -24,12 +24,27 @@ final class MailBodyFormatter {
 
     private MailBodyFormatter() {}
 
+    /** After {@code Pronóstico}: SMN bulletin {@code updated} phrase (plain), or empty. */
+    private static String pronosticoActualizacionSuffixPlain(String forecastUpdatedRaw) {
+        String line = TelegramForecastFormatter.smnActualizacionSpanishPlain(forecastUpdatedRaw);
+        return line.isEmpty() ? "" : " — " + line;
+    }
+
+    /** After {@code Pronóstico</b>}: same phrase escaped for HTML, or empty. */
+    private static String pronosticoActualizacionSuffixHtml(String forecastUpdatedRaw) {
+        String line = TelegramForecastFormatter.smnActualizacionSpanishPlain(forecastUpdatedRaw);
+        return line.isEmpty() ? "" : " — " + escHtml(line);
+    }
+
     /**
      * Current-conditions text (Spanish), optional CABA forecast block, and host footer {@code (name)}.
      *
      * @param forecastBlockPlain plain forecast (email HTML and fallback).
      * @param forecastTelegramDaysHtml trusted HTML fragment for Telegram combined message; null to use plain in
      *     {@code pre}.
+     * @param forecastUpdatedRaw SMN JSON {@code updated} for the forecast (ISO datetime); when non-blank, appended
+     *     after {@code Pronóstico} as {@code Actualización de las …} in Buenos Aires time, same wording as the
+     *     forecast bulletin headline.
      * @param locationId SMN location id (used for {@code @CABA} / {@code @AEP} in email; {@code /CABA} on Telegram
      *     HTML).
      */
@@ -40,14 +55,23 @@ final class MailBodyFormatter {
             boolean includeForecast,
             int locationId,
             String hostFooter,
+            String forecastUpdatedRaw,
             BodyTarget target) {
         if (target == BodyTarget.PLAIN_TEXT) {
-            return formatPlain(o, forecastBlockPlain, includeForecast, locationId, hostFooter);
+            return formatPlain(o, forecastBlockPlain, includeForecast, locationId, hostFooter, forecastUpdatedRaw);
         }
         if (target == BodyTarget.HTML_EMAIL) {
-            return formatHtmlEmail(o, forecastBlockPlain, includeForecast, locationId, hostFooter);
+            return formatHtmlEmail(
+                    o, forecastBlockPlain, includeForecast, locationId, hostFooter, forecastUpdatedRaw);
         }
-        return formatHtmlTelegram(o, forecastBlockPlain, forecastTelegramDaysHtml, includeForecast, locationId, hostFooter);
+        return formatHtmlTelegram(
+                o,
+                forecastBlockPlain,
+                forecastTelegramDaysHtml,
+                includeForecast,
+                locationId,
+                hostFooter,
+                forecastUpdatedRaw);
     }
 
     private static String formatPlain(
@@ -55,12 +79,15 @@ final class MailBodyFormatter {
             String forecastBlock,
             boolean includeForecast,
             int locationId,
-            String hostFooter) {
+            String hostFooter,
+            String forecastUpdatedRaw) {
         StringBuilder sb = new StringBuilder();
         appendConditionsBlockPlain(sb, o, locationId);
         if (includeForecast && forecastBlock != null && !forecastBlock.isBlank()) {
             sb.append("\n\n\n");
-            sb.append("Pronóstico\n\n");
+            sb.append("Pronóstico");
+            sb.append(pronosticoActualizacionSuffixPlain(forecastUpdatedRaw));
+            sb.append("\n\n");
             sb.append(forecastBlock.trim());
             sb.append("\n");
         }
@@ -73,13 +100,16 @@ final class MailBodyFormatter {
             String forecastBlock,
             boolean includeForecast,
             int locationId,
-            String hostFooter) {
+            String hostFooter,
+            String forecastUpdatedRaw) {
         StringBuilder sb = new StringBuilder();
         sb.append("<!DOCTYPE html><html><body style=\"font-family:sans-serif;\">");
         appendConditionsBlockHtml(sb, o, locationId, "<br>", '@');
         if (includeForecast && forecastBlock != null && !forecastBlock.isBlank()) {
             sb.append("<br><br><br>");
-            sb.append("<p><b>Pronóstico</b></p>");
+            sb.append("<p><b>Pronóstico</b>")
+                    .append(pronosticoActualizacionSuffixHtml(forecastUpdatedRaw))
+                    .append("</p>");
             sb.append("<p style=\"margin:0;\">")
                     .append(forecastPlainToHtmlWithBoldPeriods(forecastBlock.trim()))
                     .append("</p>");
@@ -95,7 +125,8 @@ final class MailBodyFormatter {
             String forecastTelegramDaysHtml,
             boolean includeForecast,
             int locationId,
-            String hostFooter) {
+            String hostFooter,
+            String forecastUpdatedRaw) {
         StringBuilder sb = new StringBuilder();
         // Telegram HTML: no @ before tag (mention parsing); use "/CABA". Bold + newlines, no br tag.
         appendConditionsBlockHtml(sb, o, locationId, "\n", '/');
@@ -105,11 +136,15 @@ final class MailBodyFormatter {
             boolean havePlain = forecastBlockPlain != null && !forecastBlockPlain.isBlank();
             if (haveDaysHtml) {
                 sb.append("\n\n\n");
-                sb.append("<b>Pronóstico</b>\n");
+                sb.append("<b>Pronóstico</b>")
+                        .append(pronosticoActualizacionSuffixHtml(forecastUpdatedRaw))
+                        .append("\n");
                 sb.append(forecastTelegramDaysHtml);
             } else if (havePlain) {
                 sb.append("\n\n\n");
-                sb.append("<b>Pronóstico</b>\n");
+                sb.append("<b>Pronóstico</b>")
+                        .append(pronosticoActualizacionSuffixHtml(forecastUpdatedRaw))
+                        .append("\n");
                 sb.append("<pre>").append(escHtml(forecastBlockPlain.trim())).append("</pre>");
             }
         }

@@ -13,8 +13,8 @@ import java.util.Locale;
 
 /**
  * Appends one line per forecast snapshot (same calendar-day file layout as {@link MeasuresDailyLog}:
- * {@code <base>/<yyyy>/<MM>/<yyyy-MM-dd>.txt}). Sources: observation email attachment, morning/evening Telegram
- * bulletin sends.
+ * {@code <base>/<yyyy>/<MM>/<yyyy-MM-dd>.txt}). Sources: observation email attachment, morning / afternoon /
+ * evening Telegram bulletin sends.
  */
 final class ForecastDailyLog {
 
@@ -39,7 +39,7 @@ final class ForecastDailyLog {
 
     /**
      * @param writtenArt    row timestamp (ART), e.g. observation time or send time
-     * @param source        {@code OBS_EMAIL}, {@code TG_MORNING}, or {@code TG_EVENING}
+     * @param source        {@code OBS_EMAIL}, {@code TG_MORNING}, {@code TG_AFTERNOON}, or {@code TG_EVENING}
      * @param smnUpdated    SMN JSON {@code updated} (may be empty)
      * @param bodyForSnippet telegram-style body (truncated to one line in the table)
      */

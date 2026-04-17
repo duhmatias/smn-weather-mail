@@ -8,14 +8,17 @@ import java.time.LocalDate;
 
 /**
  * Tracks which CABA forecast bulletins (by SMN {@code updated}) were already sent to Telegram for the
- * morning (~5:30 ART) and evening (~17:30 ART) cycles, so we do not duplicate sends and can tell when the
- * API is still serving the previous slot's bulletin.
+ * morning (~5:30 ART), optional midday refreshes (noon–17:30 ART, recorded as afternoon updates), and the
+ * evening (~17:30 ART) cycle, so we do not duplicate sends and can tell when the API is still serving the
+ * previous slot's bulletin.
  */
 final class SentForecastLog {
 
     private final Path path;
     private LocalDate morningDay;
     private String morningUpdated;
+    private LocalDate afternoonDay;
+    private String afternoonUpdated;
     private LocalDate eveningDay;
     private String eveningUpdated;
 
@@ -45,6 +48,9 @@ final class SentForecastLog {
                 if ("MORNING".equals(kind)) {
                     log.morningDay = day;
                     log.morningUpdated = updated;
+                } else if ("AFTERNOON".equals(kind)) {
+                    log.afternoonDay = day;
+                    log.afternoonUpdated = updated;
                 } else if ("EVENING".equals(kind)) {
                     log.eveningDay = day;
                     log.eveningUpdated = updated;
@@ -77,6 +83,29 @@ final class SentForecastLog {
     }
 
     /**
+     * Midday refresh (noon–before evening window): send when {@code updated} advances from today's morning
+     * (or first daytime bulletin if morning was missed), and is not a duplicate of the latest afternoon send.
+     */
+    synchronized boolean shouldSendAfternoonUpdate(LocalDate todayArt, String updated) {
+        if (updated == null || updated.isBlank()) {
+            return false;
+        }
+        if (afternoonDay != null && afternoonDay.equals(todayArt) && updated.equals(afternoonUpdated)) {
+            return false;
+        }
+        if (morningDay != null && morningDay.equals(todayArt) && updated.equals(morningUpdated)) {
+            return false;
+        }
+        if (eveningUpdated != null
+                && updated.equals(eveningUpdated)
+                && eveningDay != null
+                && (eveningDay.equals(todayArt) || eveningDay.equals(todayArt.minusDays(1)))) {
+            return false;
+        }
+        return true;
+    }
+
+    /**
      * Send evening bulletin: new {@code updated}, not duplicate of today's evening, and not still on
      * the morning bulletin for today.
      */
@@ -85,6 +114,12 @@ final class SentForecastLog {
             return false;
         }
         if (eveningDay != null && eveningDay.equals(todayArt) && updated.equals(eveningUpdated)) {
+            return false;
+        }
+        if (afternoonDay != null
+                && afternoonDay.equals(todayArt)
+                && afternoonUpdated != null
+                && updated.equals(afternoonUpdated)) {
             return false;
         }
         if (morningUpdated != null
@@ -99,6 +134,12 @@ final class SentForecastLog {
     synchronized void recordMorning(LocalDate todayArt, String updated) throws IOException {
         morningDay = todayArt;
         morningUpdated = updated;
+        rewrite();
+    }
+
+    synchronized void recordAfternoon(LocalDate todayArt, String updated) throws IOException {
+        afternoonDay = todayArt;
+        afternoonUpdated = updated;
         rewrite();
     }
 
@@ -126,6 +167,26 @@ final class SentForecastLog {
                 && updated.equals(morningUpdated);
     }
 
+    /**
+     * Same {@code updated} as latest afternoon Telegram for today, or still on today's morning bulletin with no
+     * afternoon refresh yet — slower forecast poll.
+     */
+    synchronized boolean afternoonSlotSettled(LocalDate todayArt, String updated) {
+        if (updated == null) {
+            return false;
+        }
+        if (afternoonDay != null
+                && afternoonDay.equals(todayArt)
+                && afternoonUpdated != null
+                && updated.equals(afternoonUpdated)) {
+            return true;
+        }
+        return morningDay != null
+                && morningDay.equals(todayArt)
+                && morningUpdated != null
+                && updated.equals(morningUpdated);
+    }
+
     /** After evening send: same {@code updated} until the next cycle — slower poll. */
     synchronized boolean eveningBulletinAlreadySentToday(LocalDate todayArt, String updated) {
         return eveningDay != null
@@ -138,6 +199,9 @@ final class SentForecastLog {
         StringBuilder sb = new StringBuilder();
         if (morningDay != null && morningUpdated != null) {
             sb.append("MORNING|").append(morningDay).append('|').append(morningUpdated).append('\n');
+        }
+        if (afternoonDay != null && afternoonUpdated != null) {
+            sb.append("AFTERNOON|").append(afternoonDay).append('|').append(afternoonUpdated).append('\n');
         }
         if (eveningDay != null && eveningUpdated != null) {
             sb.append("EVENING|").append(eveningDay).append('|').append(eveningUpdated).append('\n');

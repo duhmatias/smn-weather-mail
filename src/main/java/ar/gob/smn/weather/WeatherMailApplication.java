@@ -49,6 +49,7 @@ public final class WeatherMailApplication {
     private static final String DEFAULT_FORECAST_HISTORY_DIR = "smn-forecast-history";
     private static final String FH_SRC_EMAIL = "OBS_EMAIL";
     private static final String FH_TG_MORNING = "TG_MORNING";
+    private static final String FH_TG_AFTERNOON = "TG_AFTERNOON";
     private static final String FH_TG_EVENING = "TG_EVENING";
     /** CABA — only this location gets forecast in email and scheduled forecast Telegram. */
     private static final int CABA_LOCATION_ID = 4864;
@@ -58,6 +59,16 @@ public final class WeatherMailApplication {
      * is included; the following-day block is not sent in that window.
      */
     private static final LocalTime COMBINED_FORECAST_NEXT_DAY_FROM_ART = LocalTime.of(17, 0);
+    /**
+     * Scheduled CABA forecast Telegram: poll for the morning bulletin from this ART time until noon (SMN often
+     * posts the morning refresh at or after ~5:30).
+     */
+    private static final LocalTime MORNING_FORECAST_POLL_START_ART = LocalTime.of(5, 30);
+    /**
+     * Scheduled CABA forecast Telegram: poll for the evening bulletin from this ART time onward (SMN often posts
+     * the evening refresh at or after ~17:30).
+     */
+    private static final LocalTime EVENING_FORECAST_POLL_START_ART = LocalTime.of(17, 30);
     /** Degrees Celsius; below this difference, temp and sensación térmica are treated as equal for the subject. */
     private static final double TEMP_SUBJECT_EPS = 0.05;
 
@@ -135,9 +146,12 @@ public final class WeatherMailApplication {
                     SmnClient.ForecastPayload forecastPayload = null;
                     String forecastBlock = "";
                     String forecastTgDays = null;
+                    String forecastUpdatedRaw = null;
                     if (station.locationId() == CABA_LOCATION_ID) {
                         try {
                             forecastPayload = smn.fetchForecastPayload(station);
+                            String u = forecastPayload.updated();
+                            forecastUpdatedRaw = u != null && !u.isBlank() ? u.trim() : null;
                             LocalDate obsDay =
                                     o.observationTime().withZoneSameInstant(BUENOS_AIRES).toLocalDate();
                             // 17:00–23:59 ART: include obsDay + next day; 00:00–16:59 ART: obsDay only (after midnight, no
@@ -166,6 +180,7 @@ public final class WeatherMailApplication {
                             true,
                             station.locationId(),
                             reportHost,
+                            forecastUpdatedRaw,
                             MailBodyFormatter.BodyTarget.HTML_EMAIL);
                     String bodyTelegram = MailBodyFormatter.formatSingle(
                             o,
@@ -174,6 +189,7 @@ public final class WeatherMailApplication {
                             true,
                             station.locationId(),
                             reportHost,
+                            forecastUpdatedRaw,
                             MailBodyFormatter.BodyTarget.HTML_TELEGRAM);
                     String subject = subjectFor(o);
                     mail.send(config.recipients(), subject, bodyEmail);
@@ -225,7 +241,7 @@ public final class WeatherMailApplication {
      * conditionals for the “hourly bulletin not in yet” window in ART.
      */
     private enum PollCadence {
-        /** CABA forecast morning/evening window: poll every minute until SMN publishes a new {@code updated}. */
+        /** CABA forecast morning / afternoon / evening windows: poll every minute until SMN advances {@code updated}. */
         FORECAST_WINDOW(FORECAST_POLL_ACTIVE),
         /**
          * At least one station still needs a mailed observation for the current ART clock hour; local minute is
@@ -292,8 +308,10 @@ public final class WeatherMailApplication {
     }
 
     /**
-     * Before noon ART, ensure today's morning bulletin is in {@link SentForecastLog}; from noon on, ensure
-     * today's evening bulletin is. If missing, one fetch/send attempt (no time-window restriction).
+     * From {@link #MORNING_FORECAST_POLL_START_ART} until noon ART, ensure today's morning bulletin is in
+     * {@link SentForecastLog}; from noon until {@link #EVENING_FORECAST_POLL_START_ART}, optionally an afternoon
+     * refresh; from {@link #EVENING_FORECAST_POLL_START_ART} onward, today's evening bulletin. Before the morning
+     * window opens, catch-up is skipped.
      */
     private static void tryCatchUpMissingForecastTelegramOnStartup(
             SmnClient smn,
@@ -309,9 +327,17 @@ public final class WeatherMailApplication {
         ZonedDateTime art = ZonedDateTime.now(BUENOS_AIRES);
         LocalDate dayArt = art.toLocalDate();
         LocalTime t = art.toLocalTime();
-        boolean afterNoon = !t.isBefore(LocalTime.NOON);
+        if (t.isBefore(MORNING_FORECAST_POLL_START_ART) && t.isBefore(LocalTime.NOON)) {
+            LOG.info(
+                    "Forecast catch-up at startup: before "
+                            + MORNING_FORECAST_POLL_START_ART
+                            + " ART — skipping until morning window.");
+            return;
+        }
+        boolean beforeNoon = t.isBefore(LocalTime.NOON);
+        boolean eveningWindowOpen = !t.isBefore(EVENING_FORECAST_POLL_START_ART);
         try {
-            if (!afterNoon) {
+            if (beforeNoon) {
                 if (forecastSent.hasMorningRecordedFor(dayArt)) {
                     LOG.info("Forecast catch-up at startup: today's morning bulletin already recorded for " + dayArt + ".");
                     return;
@@ -319,6 +345,17 @@ public final class WeatherMailApplication {
                 LOG.info("Forecast catch-up at startup: today's morning bulletin not on file — attempting fetch.");
                 morningForecastTelegramRound(
                         smn, telegramForecast, forecastSent, dayArt, "startup", forecastHistory, reportHost);
+            } else if (!eveningWindowOpen) {
+                if (!forecastSent.hasMorningRecordedFor(dayArt)) {
+                    LOG.info(
+                            "Forecast catch-up at startup: today's morning bulletin not on file — attempting fetch (before evening window).");
+                    morningForecastTelegramRound(
+                            smn, telegramForecast, forecastSent, dayArt, "startup", forecastHistory, reportHost);
+                } else {
+                    LOG.info("Forecast catch-up at startup: afternoon window — checking for newer bulletin than morning.");
+                    afternoonForecastTelegramRound(
+                            smn, telegramForecast, forecastSent, dayArt, "startup", forecastHistory, reportHost);
+                }
             } else {
                 if (forecastSent.hasEveningRecordedFor(dayArt)) {
                     LOG.info("Forecast catch-up at startup: today's evening bulletin already recorded for " + dayArt + ".");
@@ -351,13 +388,20 @@ public final class WeatherMailApplication {
         ZonedDateTime art = ZonedDateTime.now(BUENOS_AIRES);
         LocalTime t = art.toLocalTime();
         LocalDate dayArt = art.toLocalDate();
-        boolean morningWindow = !t.isBefore(LocalTime.of(5, 15)) && t.isBefore(LocalTime.NOON);
-        boolean eveningWindow = !t.isBefore(LocalTime.of(17, 15));
-        if (!morningWindow && !eveningWindow) {
+        boolean morningWindow =
+                !t.isBefore(MORNING_FORECAST_POLL_START_ART) && t.isBefore(LocalTime.NOON);
+        boolean afternoonWindow =
+                !t.isBefore(LocalTime.NOON) && t.isBefore(EVENING_FORECAST_POLL_START_ART);
+        boolean eveningWindow = !t.isBefore(EVENING_FORECAST_POLL_START_ART);
+        if (!morningWindow && !afternoonWindow && !eveningWindow) {
             return false;
         }
         if (morningWindow) {
             return morningForecastTelegramRound(
+                    smn, telegramForecast, forecastSent, dayArt, "scheduled", forecastHistory, reportHost);
+        }
+        if (afternoonWindow) {
+            return afternoonForecastTelegramRound(
                     smn, telegramForecast, forecastSent, dayArt, "scheduled", forecastHistory, reportHost);
         }
         return eveningForecastTelegramRound(
@@ -382,6 +426,7 @@ public final class WeatherMailApplication {
                 return true;
             }
             if (forecastSent.shouldSendMorning(dayArt, u)) {
+                boolean morningUpdate = forecastSent.hasMorningRecordedFor(dayArt);
                 telegramForecast.sendHtml(forecastTelegramEnvelope(p.telegramHtml(), reportHost));
                 forecastSent.recordMorning(dayArt, u);
                 try {
@@ -395,7 +440,8 @@ public final class WeatherMailApplication {
                 } catch (IOException e) {
                     LOG.log(Level.WARNING, "Forecast history append failed (morning Telegram)", e);
                 }
-                LOG.info(() -> "Telegram forecast sent for CABA (morning, " + mode + ", updated " + u + ")");
+                String slot = morningUpdate ? "morning update" : "morning";
+                LOG.info(() -> "Telegram forecast sent for CABA (" + slot + ", " + mode + ", updated " + u + ")");
                 return false;
             }
             if (forecastSent.morningBulletinAlreadySentToday(dayArt, u)) {
@@ -406,6 +452,68 @@ public final class WeatherMailApplication {
             }
             if ("startup".equals(mode)) {
                 LOG.info("Forecast catch-up at startup: SMN still on prior bulletin for morning (updated \"" + u + "\"); scheduled poll will retry.");
+            }
+            return true;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        } catch (IOException e) {
+            LOG.log(Level.WARNING, "CABA forecast fetch for Telegram failed (" + mode + ")", e);
+            return true;
+        } catch (Exception e) {
+            LOG.log(Level.WARNING, "CABA forecast Telegram send failed (" + mode + ")", e);
+            return true;
+        }
+    }
+
+    private static boolean afternoonForecastTelegramRound(
+            SmnClient smn,
+            TelegramNotifier telegramForecast,
+            SentForecastLog forecastSent,
+            LocalDate dayArt,
+            String mode,
+            ForecastDailyLog forecastHistory,
+            String reportHost)
+            throws InterruptedException {
+        SmnClient.Station caba = cabaStation();
+        try {
+            SmnClient.ForecastPayload p = smn.fetchForecastPayload(caba);
+            String u = p.updated();
+            if (u.isBlank()) {
+                LOG.fine("CABA forecast (" + mode + "): missing \"updated\", will retry soon");
+                return true;
+            }
+            if (forecastSent.shouldSendAfternoonUpdate(dayArt, u)) {
+                telegramForecast.sendHtml(forecastTelegramEnvelope(p.telegramHtml(), reportHost));
+                forecastSent.recordAfternoon(dayArt, u);
+                try {
+                    forecastHistory.append(
+                            ZonedDateTime.now(BUENOS_AIRES),
+                            CABA_LOCATION_ID,
+                            FH_TG_AFTERNOON,
+                            u,
+                            reportHost,
+                            p.telegramText());
+                } catch (IOException e) {
+                    LOG.log(Level.WARNING, "Forecast history append failed (afternoon Telegram)", e);
+                }
+                LOG.info(() -> "Telegram forecast sent for CABA (afternoon update, " + mode + ", updated " + u + ")");
+                return false;
+            }
+            if (forecastSent.afternoonSlotSettled(dayArt, u)) {
+                if ("startup".equals(mode)) {
+                    LOG.info(
+                            "Forecast catch-up at startup: afternoon slot settled (same as morning or latest afternoon, updated "
+                                    + u
+                                    + ").");
+                }
+                return false;
+            }
+            if ("startup".equals(mode)) {
+                LOG.info(
+                        "Forecast catch-up at startup: SMN bulletin not yet advanced for afternoon (updated \""
+                                + u
+                                + "\"); scheduled poll will retry.");
             }
             return true;
         } catch (InterruptedException e) {

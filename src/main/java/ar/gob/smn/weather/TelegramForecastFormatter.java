@@ -214,26 +214,41 @@ final class TelegramForecastFormatter {
         return sb.toString();
     }
 
-    private static String formatHeader(String headerSource, String updatedRaw) {
+    /**
+     * SMN {@code updated} as in the bulletin headline, without station name or parentheses, e.g.
+     * {@code Actualización de las 12:14 del viernes 17 de abril}. Empty if {@code updatedRaw} is blank; on parse
+     * failure, {@code Actualización: } plus the trimmed raw value.
+     */
+    static String smnActualizacionSpanishPlain(String updatedRaw) {
+        if (updatedRaw == null || updatedRaw.isBlank()) {
+            return "";
+        }
+        String raw = updatedRaw.trim();
         try {
-            ZonedDateTime z = parseUpdated(updatedRaw);
+            ZonedDateTime z = parseUpdated(raw);
             String hhmm = z.format(DateTimeFormatter.ofPattern("HH:mm", ES_AR));
             String weekday = z.getDayOfWeek().getDisplayName(TextStyle.FULL, ES_AR);
             String dd = String.format(Locale.ROOT, "%02d", z.getDayOfMonth());
             String month = z.getMonth().getDisplayName(TextStyle.FULL, ES_AR);
-            return headerSource
-                    + " (Actualización de las "
+            return "Actualización de las "
                     + hhmm
                     + " del "
                     + weekday
                     + " "
                     + dd
                     + " de "
-                    + month
-                    + ").";
+                    + month;
         } catch (DateTimeException e) {
-            return headerSource + " (Actualización: " + updatedRaw + ").";
+            return "Actualización: " + raw;
         }
+    }
+
+    private static String formatHeader(String headerSource, String updatedRaw) {
+        String line = smnActualizacionSpanishPlain(updatedRaw);
+        if (line.isEmpty()) {
+            return headerSource + ".";
+        }
+        return headerSource + " (" + line + ").";
     }
 
     private static ZonedDateTime parseUpdated(String updatedRaw) {
