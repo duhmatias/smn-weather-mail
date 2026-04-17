@@ -67,26 +67,56 @@ final class TelegramForecastFormatter {
      * first SMN day if no exact date match.
      */
     static String formatTelegramHtmlDaySlice(String jsonBody, LocalDate dayArt) throws IOException {
+        return formatTelegramHtmlDaySlices(jsonBody, dayArt, null);
+    }
+
+    /**
+     * One or two day blocks for combined conditions + forecast: primary day and optional second (e.g. day after
+     * observation) when SMN exposes it.
+     */
+    static String formatTelegramHtmlDaySlices(String jsonBody, LocalDate dayArt, LocalDate secondDayOrNull)
+            throws IOException {
         JsonNode root = JSON.readTree(jsonBody);
         JsonNode days = root.path("forecast");
         if (!days.isArray() || days.isEmpty()) {
             return escTg("(Sin días de pronóstico en la respuesta.)");
         }
-        JsonNode day = findForecastDayForDate(days, dayArt);
+        JsonNode first = findForecastDayForDate(days, dayArt);
         LocalDate todayArt = LocalDate.now(BUENOS_AIRES);
         StringBuilder sb = new StringBuilder();
-        appendDayBlockHtml(sb, day, todayArt);
+        appendDayBlockHtml(sb, first, todayArt);
+        if (secondDayOrNull != null) {
+            LocalDate firstD = parseForecastDay(first.path("date").asText(""));
+            if (!secondDayOrNull.equals(firstD)) {
+                JsonNode second = findForecastDayStrict(days, secondDayOrNull);
+                if (second != null) {
+                    sb.append('\n');
+                    appendDayBlockHtml(sb, second, todayArt);
+                }
+            }
+        }
         return sb.toString();
     }
 
-    private static JsonNode findForecastDayForDate(JsonNode days, LocalDate target) {
+    private static JsonNode findForecastDayStrict(JsonNode days, LocalDate target) {
+        if (!days.isArray()) {
+            return null;
+        }
         for (int i = 0; i < days.size(); i++) {
             JsonNode d = days.get(i);
             if (target.equals(parseForecastDay(d.path("date").asText("")))) {
                 return d;
             }
         }
-        return days.get(0);
+        return null;
+    }
+
+    private static JsonNode findForecastDayForDate(JsonNode days, LocalDate target) {
+        JsonNode strict = findForecastDayStrict(days, target);
+        if (strict != null) {
+            return strict;
+        }
+        return !days.isEmpty() ? days.get(0) : null;
     }
 
     private static void appendForecastDaysHtml(StringBuilder sb, JsonNode root) {

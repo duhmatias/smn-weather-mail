@@ -52,6 +52,12 @@ public final class WeatherMailApplication {
     private static final String FH_TG_EVENING = "TG_EVENING";
     /** CABA — only this location gets forecast in email and scheduled forecast Telegram. */
     private static final int CABA_LOCATION_ID = 4864;
+    /**
+     * Combined conditions + forecast (CABA): append the next calendar day’s slice only when ART local time is
+     * {@code >=} this value (17:00 through 23:59). From midnight (12:00 AM) through 16:59, only the observation day
+     * is included; the following-day block is not sent in that window.
+     */
+    private static final LocalTime COMBINED_FORECAST_NEXT_DAY_FROM_ART = LocalTime.of(17, 0);
     /** Degrees Celsius; below this difference, temp and sensación térmica are treated as equal for the subject. */
     private static final double TEMP_SUBJECT_EPS = 0.05;
 
@@ -134,12 +140,19 @@ public final class WeatherMailApplication {
                             forecastPayload = smn.fetchForecastPayload(station);
                             LocalDate obsDay =
                                     o.observationTime().withZoneSameInstant(BUENOS_AIRES).toLocalDate();
+                            // 17:00–23:59 ART: include obsDay + next day; 00:00–16:59 ART: obsDay only (after midnight, no
+                            // following-day slice until 5pm).
+                            boolean afterFivePmArt =
+                                    !ZonedDateTime.now(BUENOS_AIRES)
+                                            .toLocalTime()
+                                            .isBefore(COMBINED_FORECAST_NEXT_DAY_FROM_ART);
+                            LocalDate secondForecastDay = afterFivePmArt ? obsDay.plusDays(1) : null;
                             forecastBlock =
-                                    ForecastFormatter.formatForCalendarDay(
-                                            forecastPayload.forecastJson(), obsDay);
+                                    ForecastFormatter.formatForCalendarDays(
+                                            forecastPayload.forecastJson(), obsDay, secondForecastDay);
                             forecastTgDays =
-                                    TelegramForecastFormatter.formatTelegramHtmlDaySlice(
-                                            forecastPayload.forecastJson(), obsDay);
+                                    TelegramForecastFormatter.formatTelegramHtmlDaySlices(
+                                            forecastPayload.forecastJson(), obsDay, secondForecastDay);
                         } catch (InterruptedException e) {
                             Thread.currentThread().interrupt();
                         } catch (IOException e) {

@@ -56,6 +56,15 @@ final class ForecastFormatter {
      * matching row, uses the first day in the array.
      */
     static String formatForCalendarDay(String jsonBody, LocalDate dayArt) throws IOException {
+        return formatForCalendarDays(jsonBody, dayArt, null);
+    }
+
+    /**
+     * Header once, then one or two day blocks: primary (matched like {@link #formatForCalendarDay}) and optional
+     * second day only if {@code secondDay} is non-null, distinct from the primary’s date, and present in the JSON.
+     */
+    static String formatForCalendarDays(String jsonBody, LocalDate dayArt, LocalDate secondDayOrNull)
+            throws IOException {
         JsonNode root = JSON.readTree(jsonBody);
         String updated = root.path("updated").asText("").trim();
         StringBuilder sb = new StringBuilder();
@@ -68,24 +77,40 @@ final class ForecastFormatter {
             sb.append("(No forecast days in response.)\n");
             return sb.toString();
         }
-        JsonNode day = findForecastDayForDate(days, dayArt);
-        if (day == null) {
-            sb.append("(No forecast days in response.)\n");
-            return sb.toString();
+        JsonNode first = findForecastDayForDate(days, dayArt);
+        appendDay(sb, first);
+        if (secondDayOrNull != null) {
+            LocalDate firstDate = parseForecastLocalDate(first.path("date").asText(""));
+            if (!secondDayOrNull.equals(firstDate)) {
+                JsonNode second = findForecastDayStrict(days, secondDayOrNull);
+                if (second != null) {
+                    appendDay(sb, second);
+                }
+            }
         }
-        appendDay(sb, day);
         sb.append("\n");
         return sb.toString();
     }
 
-    private static JsonNode findForecastDayForDate(JsonNode days, LocalDate target) {
+    private static JsonNode findForecastDayStrict(JsonNode days, LocalDate target) {
+        if (!days.isArray()) {
+            return null;
+        }
         for (int i = 0; i < days.size(); i++) {
             JsonNode day = days.get(i);
             if (target.equals(parseForecastLocalDate(day.path("date").asText("")))) {
                 return day;
             }
         }
-        return days.get(0);
+        return null;
+    }
+
+    private static JsonNode findForecastDayForDate(JsonNode days, LocalDate target) {
+        JsonNode strict = findForecastDayStrict(days, target);
+        if (strict != null) {
+            return strict;
+        }
+        return days.isArray() && !days.isEmpty() ? days.get(0) : null;
     }
 
     private static LocalDate parseForecastLocalDate(String dateStr) {
