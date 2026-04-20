@@ -142,6 +142,15 @@ public final class WeatherMailApplication {
         String reportHost = resolveReportHostLabel(config);
         LOG.info(() -> "Condition messages host footer: " + reportHost + " (smn.report.host / SMN_REPORT_HOST / HOSTNAME)");
 
+        String commandsBotToken = config.telegramCommandsBotToken();
+        if (commandsBotToken != null && !commandsBotToken.isBlank()) {
+            Thread cmdThread =
+                    new Thread(new TelegramBotCommandListener(commandsBotToken, reportHost), "telegram-commands");
+            cmdThread.setDaemon(true);
+            cmdThread.start();
+            LOG.info("Telegram command listener: on (getUpdates /hello → world! + host line)");
+        }
+
         tryCatchUpMissingForecastTelegramOnStartup(
                 smn, telegramForecast, forecastSent, configIncludesCaba, forecastHistory, reportHost);
 

@@ -34,6 +34,11 @@ final class Config {
      * uses {@link #telegram()}.
      */
     private final Telegram telegramSummariesConfig;
+    /**
+     * Nullable: optional bot token used only to long-poll {@code getUpdates} and handle slash commands (e.g. {@code /hello}).
+     * Does not require {@link #telegram()} or chat ids.
+     */
+    private final String telegramCommandsBotToken;
     /** Nullable: {@code SMN_REPORT_HOST} / {@code smn.report.host} for message footer; else OS hostname. */
     private final String reportHostLabel;
 
@@ -49,6 +54,7 @@ final class Config {
             Telegram telegram,
             Telegram telegramForecastConfig,
             Telegram telegramSummariesConfig,
+            String telegramCommandsBotToken,
             String reportHostLabel) {
         this.smtpHost = smtpHost;
         this.smtpPort = smtpPort;
@@ -61,6 +67,7 @@ final class Config {
         this.telegram = telegram;
         this.telegramForecastConfig = telegramForecastConfig;
         this.telegramSummariesConfig = telegramSummariesConfig;
+        this.telegramCommandsBotToken = telegramCommandsBotToken;
         this.reportHostLabel = reportHostLabel;
     }
 
@@ -141,6 +148,14 @@ final class Config {
         Telegram telegramForecastConfig = parseForecastTelegram(fileProps, telegram);
         Telegram telegramSummariesConfig = parseSummariesTelegram(fileProps, telegram);
 
+        String commandsToken =
+                firstNonBlank(System.getenv("TELEGRAM_COMMANDS_BOT_TOKEN"), null, fileProps, "telegram.commands.bot.token");
+        if (commandsToken != null && !commandsToken.isBlank()) {
+            commandsToken = normalizeTelegramBotToken(commandsToken.trim());
+        } else {
+            commandsToken = null;
+        }
+
         String reportHost = firstNonBlank(System.getenv("SMN_REPORT_HOST"), null, fileProps, "smn.report.host");
         if (reportHost != null) {
             reportHost = reportHost.trim();
@@ -150,7 +165,19 @@ final class Config {
         }
 
         return new Config(
-                host, port, user, password, from, startTls, ssl, recipients, telegram, telegramForecastConfig, telegramSummariesConfig, reportHost);
+                host,
+                port,
+                user,
+                password,
+                from,
+                startTls,
+                ssl,
+                recipients,
+                telegram,
+                telegramForecastConfig,
+                telegramSummariesConfig,
+                commandsToken,
+                reportHost);
     }
 
     /**
@@ -420,6 +447,13 @@ final class Config {
         return telegramSummariesConfig != null ? telegramSummariesConfig : telegram;
     }
 
+    /**
+     * Bot token for optional {@link TelegramBotCommandListener} ({@code getUpdates}). {@code null} when unset.
+     */
+    String telegramCommandsBotToken() {
+        return telegramCommandsBotToken;
+    }
+
     /** Nullable explicit label for {@code (host)} footer in condition messages. */
     String reportHostLabel() {
         return reportHostLabel;
@@ -470,6 +504,8 @@ final class Config {
                                         && telegramSummariesConfig.botToken().equals(telegram.botToken())
                                 ? "otherChats"
                                 : "otherBot"))
+                + ", commandsBot="
+                + (telegramCommandsBotToken != null ? "on" : "off")
                 + "}";
     }
 }
