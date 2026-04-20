@@ -51,6 +51,9 @@ public final class WeatherMailApplication {
     private static final String DEFAULT_MEASURES_DIR = "smn-measures";
     private static final String DEFAULT_FORECAST_HISTORY_DIR = "smn-forecast-history";
     private static final String DEFAULT_MEASURES_SUMMARY_SENT = "smn-measures-summary-sent.txt";
+    private static final String DEFAULT_FORECAST_VALIDATION_SENT = "smn-forecast-validation-sent.txt";
+    private static final String DEFAULT_HISTORICAL_ARCHIVE_SENT = "smn-historical-archive-sent.txt";
+    private static final String DEFAULT_HISTORICAL_ARCHIVE_ZIP_DIR = "smn-historical-archives";
     private static final String FH_SRC_EMAIL = "OBS_EMAIL";
     private static final String FH_TG_MORNING = "TG_MORNING";
     private static final String FH_TG_AFTERNOON = "TG_AFTERNOON";
@@ -106,6 +109,11 @@ public final class WeatherMailApplication {
         MeasuresDailyLog measures = new MeasuresDailyLog(measuresDir);
         Path forecastHistoryDir = forecastHistoryDirFromEnv();
         ForecastDailyLog forecastHistory = new ForecastDailyLog(forecastHistoryDir);
+        ForecastDaySnapshotLog forecastDaySnapshotLog =
+                new ForecastDaySnapshotLog(forecastHistoryDir.resolve("forecast-day-snapshots.log"));
+        Path forecastValidationSentPath = forecastValidationSentPathFromEnv();
+        Path historicalArchiveStatePath = historicalArchiveStatePathFromEnv();
+        Path historicalArchiveZipDir = historicalArchiveZipDirFromEnv();
         boolean configIncludesCaba = stationListIncludesCaba(stations);
 
         LOG.info(() -> "Stations: " + stations);
@@ -115,6 +123,15 @@ public final class WeatherMailApplication {
         LOG.info(() -> "Measures summary dedupe: " + measuresSummarySentPath.toAbsolutePath()
                 + " (daily 08:00 ART previous day; Mon 08:00 previous week; 1st 08:00 previous month)");
         LOG.info(() -> "Forecast history dir: " + forecastHistoryDir.toAbsolutePath() + " (YYYY/MM/<day>.txt)");
+        LOG.info(() -> "Forecast day snapshots: "
+                + forecastHistoryDir.resolve("forecast-day-snapshots.log").toAbsolutePath());
+        LOG.info(() -> "Forecast validation dedupe: " + forecastValidationSentPath.toAbsolutePath()
+                + " (08:00 ART previous day vs first forecast JSON logged)");
+        LOG.info(() -> "Historical month archive: state "
+                + historicalArchiveStatePath.toAbsolutePath()
+                + " | zip dir "
+                + historicalArchiveZipDir.toAbsolutePath()
+                + " (ART: on/after 1st, zip month now−2 under measures + forecast-history, delete originals)");
         LOG.info(() -> "Recipients: " + config.recipients() + " | zone: " + BUENOS_AIRES + " | poll: " + POLL_INTERVAL
                 + " (2m through :19, 5m from :20 if hourly bulletin still pending) | pause between stations: "
                 + SLEEP_BETWEEN_STATIONS);
@@ -152,14 +169,43 @@ public final class WeatherMailApplication {
         }
 
         tryCatchUpMissingForecastTelegramOnStartup(
-                smn, telegramForecast, forecastSent, configIncludesCaba, forecastHistory, reportHost);
+                smn,
+                telegramForecast,
+                forecastSent,
+                configIncludesCaba,
+                forecastHistory,
+                forecastDaySnapshotLog,
+                reportHost);
 
         tryCatchUpMeasuresSummariesOnStartup(
                 measuresDir, measuresSummarySentPath, stations, config, mail, telegramMeasuresSummary, reportHost);
 
+        tryCatchUpForecastValidationOnStartup(
+                measuresDir,
+                forecastDaySnapshotLog,
+                forecastValidationSentPath,
+                configIncludesCaba,
+                config,
+                mail,
+                telegramConditions,
+                reportHost);
+
+        HistoricalMonthArchive.validateStateOnStartup(historicalArchiveStatePath, BUENOS_AIRES);
+        tryHistoricalMonthArchive(measuresDir, forecastHistoryDir, historicalArchiveStatePath, historicalArchiveZipDir);
+
         while (true) {
+            tryHistoricalMonthArchive(measuresDir, forecastHistoryDir, historicalArchiveStatePath, historicalArchiveZipDir);
             trySendMeasuresSummaries(
                     measuresDir, measuresSummarySentPath, stations, config, mail, telegramMeasuresSummary, reportHost);
+            trySendForecastValidation(
+                    measuresDir,
+                    forecastDaySnapshotLog,
+                    forecastValidationSentPath,
+                    configIncludesCaba,
+                    config,
+                    mail,
+                    telegramConditions,
+                    reportHost);
             ZonedDateTime nowHourArt = ZonedDateTime.now(BUENOS_AIRES).truncatedTo(ChronoUnit.HOURS);
             for (int i = 0; i < stations.size(); i++) {
                 SmnClient.Station station = stations.get(i);
@@ -249,6 +295,11 @@ public final class WeatherMailApplication {
                                     forecastPayload.updated() != null ? forecastPayload.updated() : "",
                                     reportHost,
                                     forecastPayload.telegramText());
+                            appendForecastDaySnapshots(
+                                    forecastDaySnapshotLog,
+                                    obsArt,
+                                    forecastPayload.forecastJson(),
+                                    forecastPayload.updated());
                         }
                     } catch (IOException e) {
                         LOG.log(Level.WARNING, "Measures/forecast history append failed for " + station, e);
@@ -265,7 +316,13 @@ public final class WeatherMailApplication {
             }
             boolean fastForecastPoll =
                     trySendCabaForecastTelegram(
-                            smn, telegramForecast, forecastSent, configIncludesCaba, forecastHistory, reportHost);
+                            smn,
+                            telegramForecast,
+                            forecastSent,
+                            configIncludesCaba,
+                            forecastHistory,
+                            forecastDaySnapshotLog,
+                            reportHost);
             Thread.sleep(PollCadence.resolve(fastForecastPoll, stations, lastMailedObsHourArt).sleepMillis());
         }
     }
@@ -353,6 +410,7 @@ public final class WeatherMailApplication {
             SentForecastLog forecastSent,
             boolean configIncludesCaba,
             ForecastDailyLog forecastHistory,
+            ForecastDaySnapshotLog forecastDaySnapshotLog,
             String reportHost) {
         if (telegramForecast == null || !configIncludesCaba) {
             LOG.info("Forecast catch-up at startup: skipped (Telegram off or CABA not in SMN_LOCATION_IDS).");
@@ -378,17 +436,38 @@ public final class WeatherMailApplication {
                 }
                 LOG.info("Forecast catch-up at startup: today's morning bulletin not on file — attempting fetch.");
                 morningForecastTelegramRound(
-                        smn, telegramForecast, forecastSent, dayArt, "startup", forecastHistory, reportHost);
+                        smn,
+                        telegramForecast,
+                        forecastSent,
+                        dayArt,
+                        "startup",
+                        forecastHistory,
+                        forecastDaySnapshotLog,
+                        reportHost);
             } else if (!eveningWindowOpen) {
                 if (!forecastSent.hasMorningRecordedFor(dayArt)) {
                     LOG.info(
                             "Forecast catch-up at startup: today's morning bulletin not on file — attempting fetch (before evening window).");
                     morningForecastTelegramRound(
-                            smn, telegramForecast, forecastSent, dayArt, "startup", forecastHistory, reportHost);
+                            smn,
+                            telegramForecast,
+                            forecastSent,
+                            dayArt,
+                            "startup",
+                            forecastHistory,
+                            forecastDaySnapshotLog,
+                            reportHost);
                 } else {
                     LOG.info("Forecast catch-up at startup: afternoon window — checking for newer bulletin than morning.");
                     afternoonForecastTelegramRound(
-                            smn, telegramForecast, forecastSent, dayArt, "startup", forecastHistory, reportHost);
+                            smn,
+                            telegramForecast,
+                            forecastSent,
+                            dayArt,
+                            "startup",
+                            forecastHistory,
+                            forecastDaySnapshotLog,
+                            reportHost);
                 }
             } else {
                 if (forecastSent.hasEveningRecordedFor(dayArt)) {
@@ -397,7 +476,14 @@ public final class WeatherMailApplication {
                 }
                 LOG.info("Forecast catch-up at startup: today's evening bulletin not on file — attempting fetch.");
                 eveningForecastTelegramRound(
-                        smn, telegramForecast, forecastSent, dayArt, "startup", forecastHistory, reportHost);
+                        smn,
+                        telegramForecast,
+                        forecastSent,
+                        dayArt,
+                        "startup",
+                        forecastHistory,
+                        forecastDaySnapshotLog,
+                        reportHost);
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -414,6 +500,7 @@ public final class WeatherMailApplication {
             SentForecastLog forecastSent,
             boolean configIncludesCaba,
             ForecastDailyLog forecastHistory,
+            ForecastDaySnapshotLog forecastDaySnapshotLog,
             String reportHost)
             throws InterruptedException {
         if (telegramForecast == null || !configIncludesCaba) {
@@ -432,14 +519,35 @@ public final class WeatherMailApplication {
         }
         if (morningWindow) {
             return morningForecastTelegramRound(
-                    smn, telegramForecast, forecastSent, dayArt, "scheduled", forecastHistory, reportHost);
+                    smn,
+                    telegramForecast,
+                    forecastSent,
+                    dayArt,
+                    "scheduled",
+                    forecastHistory,
+                    forecastDaySnapshotLog,
+                    reportHost);
         }
         if (afternoonWindow) {
             return afternoonForecastTelegramRound(
-                    smn, telegramForecast, forecastSent, dayArt, "scheduled", forecastHistory, reportHost);
+                    smn,
+                    telegramForecast,
+                    forecastSent,
+                    dayArt,
+                    "scheduled",
+                    forecastHistory,
+                    forecastDaySnapshotLog,
+                    reportHost);
         }
         return eveningForecastTelegramRound(
-                smn, telegramForecast, forecastSent, dayArt, "scheduled", forecastHistory, reportHost);
+                smn,
+                telegramForecast,
+                forecastSent,
+                dayArt,
+                "scheduled",
+                forecastHistory,
+                forecastDaySnapshotLog,
+                reportHost);
     }
 
     private static boolean morningForecastTelegramRound(
@@ -449,6 +557,7 @@ public final class WeatherMailApplication {
             LocalDate dayArt,
             String mode,
             ForecastDailyLog forecastHistory,
+            ForecastDaySnapshotLog forecastDaySnapshotLog,
             String reportHost)
             throws InterruptedException {
         SmnClient.Station caba = cabaStation();
@@ -464,13 +573,16 @@ public final class WeatherMailApplication {
                 telegramForecast.sendHtml(forecastTelegramEnvelope(p.telegramHtml(), reportHost));
                 forecastSent.recordMorning(dayArt, u);
                 try {
+                    ZonedDateTime sentArt = ZonedDateTime.now(BUENOS_AIRES);
                     forecastHistory.append(
-                            ZonedDateTime.now(BUENOS_AIRES),
+                            sentArt,
                             CABA_LOCATION_ID,
                             FH_TG_MORNING,
                             u,
                             reportHost,
                             p.telegramText());
+                    appendForecastDaySnapshots(
+                            forecastDaySnapshotLog, sentArt, p.forecastJson(), p.updated());
                 } catch (IOException e) {
                     LOG.log(Level.WARNING, "Forecast history append failed (morning Telegram)", e);
                 }
@@ -507,6 +619,7 @@ public final class WeatherMailApplication {
             LocalDate dayArt,
             String mode,
             ForecastDailyLog forecastHistory,
+            ForecastDaySnapshotLog forecastDaySnapshotLog,
             String reportHost)
             throws InterruptedException {
         SmnClient.Station caba = cabaStation();
@@ -521,13 +634,16 @@ public final class WeatherMailApplication {
                 telegramForecast.sendHtml(forecastTelegramEnvelope(p.telegramHtml(), reportHost));
                 forecastSent.recordAfternoon(dayArt, u);
                 try {
+                    ZonedDateTime sentArt = ZonedDateTime.now(BUENOS_AIRES);
                     forecastHistory.append(
-                            ZonedDateTime.now(BUENOS_AIRES),
+                            sentArt,
                             CABA_LOCATION_ID,
                             FH_TG_AFTERNOON,
                             u,
                             reportHost,
                             p.telegramText());
+                    appendForecastDaySnapshots(
+                            forecastDaySnapshotLog, sentArt, p.forecastJson(), p.updated());
                 } catch (IOException e) {
                     LOG.log(Level.WARNING, "Forecast history append failed (afternoon Telegram)", e);
                 }
@@ -569,6 +685,7 @@ public final class WeatherMailApplication {
             LocalDate dayArt,
             String mode,
             ForecastDailyLog forecastHistory,
+            ForecastDaySnapshotLog forecastDaySnapshotLog,
             String reportHost)
             throws InterruptedException {
         SmnClient.Station caba = cabaStation();
@@ -583,13 +700,16 @@ public final class WeatherMailApplication {
                 telegramForecast.sendHtml(forecastTelegramEnvelope(p.telegramHtml(), reportHost));
                 forecastSent.recordEvening(dayArt, u);
                 try {
+                    ZonedDateTime sentArt = ZonedDateTime.now(BUENOS_AIRES);
                     forecastHistory.append(
-                            ZonedDateTime.now(BUENOS_AIRES),
+                            sentArt,
                             CABA_LOCATION_ID,
                             FH_TG_EVENING,
                             u,
                             reportHost,
                             p.telegramText());
+                    appendForecastDaySnapshots(
+                            forecastDaySnapshotLog, sentArt, p.forecastJson(), p.updated());
                 } catch (IOException e) {
                     LOG.log(Level.WARNING, "Forecast history append failed (evening Telegram)", e);
                 }
@@ -709,6 +829,52 @@ public final class WeatherMailApplication {
         return Path.of(DEFAULT_MEASURES_SUMMARY_SENT);
     }
 
+    private static Path forecastValidationSentPathFromEnv() {
+        String raw = System.getenv("SMN_FORECAST_VALIDATION_SENT_FILE");
+        if (raw != null && !raw.isBlank()) {
+            return Path.of(raw.trim());
+        }
+        return Path.of(DEFAULT_FORECAST_VALIDATION_SENT);
+    }
+
+    private static Path historicalArchiveStatePathFromEnv() {
+        String raw = System.getenv("SMN_HISTORICAL_ARCHIVE_STATE_FILE");
+        if (raw != null && !raw.isBlank()) {
+            return Path.of(raw.trim());
+        }
+        return Path.of(DEFAULT_HISTORICAL_ARCHIVE_SENT);
+    }
+
+    private static Path historicalArchiveZipDirFromEnv() {
+        String raw = System.getenv("SMN_HISTORICAL_ARCHIVE_ZIP_DIR");
+        if (raw != null && !raw.isBlank()) {
+            return Path.of(raw.trim());
+        }
+        return Path.of(DEFAULT_HISTORICAL_ARCHIVE_ZIP_DIR);
+    }
+
+    private static void tryHistoricalMonthArchive(
+            Path measuresDir, Path forecastHistoryDir, Path stateFile, Path zipOutputDir) {
+        try {
+            HistoricalMonthArchive.tryProcess(measuresDir, forecastHistoryDir, stateFile, zipOutputDir, BUENOS_AIRES);
+        } catch (IOException e) {
+            LOG.log(Level.WARNING, "Historical month archive failed: " + e.getMessage(), e);
+        }
+    }
+
+    /** Appends per-day rows from SMN JSON whenever we log a CABA forecast (email or Telegram). */
+    private static void appendForecastDaySnapshots(
+            ForecastDaySnapshotLog snapLog,
+            ZonedDateTime writtenArt,
+            String forecastJson,
+            String smnUpdated) {
+        try {
+            snapLog.append(writtenArt, CABA_LOCATION_ID, forecastJson, smnUpdated != null ? smnUpdated : "");
+        } catch (IOException e) {
+            LOG.log(Level.FINE, "Forecast day snapshot log: " + e.getMessage(), e);
+        }
+    }
+
     private static boolean measuresSummaryScheduledPollWindow(LocalTime lt) {
         return lt.getHour() == 8 && lt.getMinute() <= 29;
     }
@@ -740,6 +906,161 @@ public final class WeatherMailApplication {
         } catch (IOException e) {
             LOG.log(Level.WARNING, "Measures summary sent log unreadable at startup: " + summarySentPath, e);
         }
+    }
+
+    /**
+     * After 08:00 ART on startup: send forecast-vs-observed validation for yesterday if the key for today is not in
+     * the dedupe file (same window policy as measures summaries).
+     */
+    private static void tryCatchUpForecastValidationOnStartup(
+            Path measuresDir,
+            ForecastDaySnapshotLog snapshotLog,
+            Path validationSentPath,
+            boolean configIncludesCaba,
+            Config config,
+            MailSender mail,
+            TelegramNotifier telegramConditions,
+            String reportHost) {
+        if (!configIncludesCaba) {
+            return;
+        }
+        ZonedDateTime nowArt = ZonedDateTime.now(BUENOS_AIRES);
+        if (nowArt.toLocalTime().isBefore(LocalTime.of(8, 0))) {
+            LOG.info(
+                    "Forecast validation catch-up at startup: before 08:00 ART — skipping; scheduled send in 08:00–08:29 window.");
+            return;
+        }
+        try {
+            MeasuresSummarySentLog sent = MeasuresSummarySentLog.open(validationSentPath);
+            runForecastValidationForToday(
+                    measuresDir,
+                    snapshotLog,
+                    sent,
+                    config,
+                    mail,
+                    telegramConditions,
+                    reportHost,
+                    "startup catch-up");
+        } catch (IOException e) {
+            LOG.log(Level.WARNING, "Forecast validation sent log unreadable at startup: " + validationSentPath, e);
+        }
+    }
+
+    /**
+     * Daily 08:00–08:29 ART: compare yesterday’s CABA measures (min/max, rain) with the earliest SMN JSON snapshot
+     * that included that calendar day (see {@link ForecastDaySnapshotLog}).
+     */
+    private static void trySendForecastValidation(
+            Path measuresDir,
+            ForecastDaySnapshotLog snapshotLog,
+            Path validationSentPath,
+            boolean configIncludesCaba,
+            Config config,
+            MailSender mail,
+            TelegramNotifier telegramConditions,
+            String reportHost) {
+        if (!configIncludesCaba) {
+            return;
+        }
+        ZonedDateTime nowArt = ZonedDateTime.now(BUENOS_AIRES);
+        LocalTime lt = nowArt.toLocalTime();
+        if (!measuresSummaryScheduledPollWindow(lt)) {
+            return;
+        }
+        try {
+            MeasuresSummarySentLog sent = MeasuresSummarySentLog.open(validationSentPath);
+            runForecastValidationForToday(
+                    measuresDir,
+                    snapshotLog,
+                    sent,
+                    config,
+                    mail,
+                    telegramConditions,
+                    reportHost,
+                    "scheduled");
+        } catch (IOException e) {
+            LOG.log(Level.WARNING, "Forecast validation sent log unreadable: " + validationSentPath, e);
+        }
+    }
+
+    private static void runForecastValidationForToday(
+            Path measuresDir,
+            ForecastDaySnapshotLog snapshotLog,
+            MeasuresSummarySentLog sent,
+            Config config,
+            MailSender mail,
+            TelegramNotifier telegramConditions,
+            String reportHost,
+            String logMode) {
+        LocalDate today = ZonedDateTime.now(BUENOS_AIRES).toLocalDate();
+        String key = "VALIDATION|" + today;
+        if (sent.contains(key)) {
+            return;
+        }
+        LocalDate dataDay = today.minusDays(1);
+        SmnClient.Station caba = cabaStation();
+        try {
+            List<MeasuresHistoryReader.MeasureRow> rows =
+                    MeasuresHistoryReader.readDay(measuresDir, dataDay, CABA_LOCATION_ID);
+            Optional<MeasuresSummaryMessages.TempPeriod> observed = MeasuresSummaryMessages.aggregateTemps(rows);
+            boolean observedRain = false;
+            for (MeasuresHistoryReader.MeasureRow r : rows) {
+                if (MeasuresHistoryReader.looksLikeRain(r.conditions())) {
+                    observedRain = true;
+                    break;
+                }
+            }
+            Optional<ForecastDaySnapshotLog.SnapshotRow> firstForecast =
+                    snapshotLog.findFirstSnapshot(dataDay, CABA_LOCATION_ID);
+            String subj = ForecastValidationMessages.subject(dataDay);
+            String html =
+                    ForecastValidationMessages.buildEmailHtml(
+                            caba.label(), dataDay, observed, observedRain, firstForecast, reportHost);
+            String tg =
+                    ForecastValidationMessages.buildTelegramHtml(
+                            caba.label(), dataDay, observed, observedRain, firstForecast, reportHost);
+            if (sendForecastValidationMailTelegram(config, mail, telegramConditions, subj, html, tg, reportHost)) {
+                try {
+                    sent.record(key);
+                    if ("startup catch-up".equals(logMode)) {
+                        LOG.info(() -> "Forecast validation catch-up at startup: recorded " + key);
+                    }
+                } catch (IOException e) {
+                    LOG.log(Level.WARNING, "Failed to record forecast validation key", e);
+                }
+            }
+        } catch (IOException e) {
+            LOG.log(Level.FINE, "Forecast validation failed for " + dataDay + ": " + e.getMessage(), e);
+        }
+    }
+
+    private static boolean sendForecastValidationMailTelegram(
+            Config config,
+            MailSender mail,
+            TelegramNotifier telegramConditions,
+            String subject,
+            String htmlEmail,
+            String telegramHtml,
+            String reportHost) {
+        String plain =
+                MeasuresSummaryMessages.telegramContentAsPlain(telegramHtml == null ? "" : telegramHtml.trim());
+        String h = reportHost != null && !reportHost.isBlank() ? reportHost.trim() : "unknown";
+        String plainEmail = plain.isEmpty() ? "(" + h + ")" : plain;
+        try {
+            mail.sendHtmlWithPlain(config.recipients(), subject, plainEmail, htmlEmail);
+            LOG.info(() -> "Forecast validation email sent (HTML + plain): " + subject);
+        } catch (Exception e) {
+            LOG.log(Level.WARNING, "Forecast validation email failed: " + subject, e);
+            return false;
+        }
+        if (telegramConditions != null && telegramHtml != null && !telegramHtml.isBlank()) {
+            try {
+                telegramConditions.sendHtml(telegramHtml.trim());
+            } catch (Exception e) {
+                LOG.log(Level.WARNING, "Forecast validation Telegram failed: " + subject, e);
+            }
+        }
+        return true;
     }
 
     /**
