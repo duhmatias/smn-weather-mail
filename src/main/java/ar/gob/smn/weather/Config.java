@@ -35,10 +35,25 @@ final class Config {
      */
     private final Telegram telegramSummariesConfig;
     /**
+     * Nullable forecast-validation routing (daily 08:00 ART). When {@code null}, {@link #telegramForValidation()} uses
+     * {@link #telegram()}.
+     */
+    private final Telegram telegramValidationConfig;
+    /**
      * Nullable: optional bot token used only to long-poll {@code getUpdates} and handle slash commands (e.g. {@code /hello}).
      * Does not require {@link #telegram()} or chat ids.
      */
     private final String telegramCommandsBotToken;
+    /**
+     * Nullable: second bot used only to {@code sendPhoto} for {@code /image} (topes SMN). Does not require main
+     * {@link #telegram()} chat ids.
+     */
+    private final String telegramImageBotToken;
+    /**
+     * Nullable: direct image URL override for “tope nuboso zona centro”. When unset, the app uses the SMN JSON API +
+     * static host (see {@code SmnTopesCentroImageFetcher}).
+     */
+    private final String smnTopesCentroImageUrl;
     /** Nullable: {@code SMN_REPORT_HOST} / {@code smn.report.host} for message footer; else OS hostname. */
     private final String reportHostLabel;
 
@@ -54,7 +69,10 @@ final class Config {
             Telegram telegram,
             Telegram telegramForecastConfig,
             Telegram telegramSummariesConfig,
+            Telegram telegramValidationConfig,
             String telegramCommandsBotToken,
+            String telegramImageBotToken,
+            String smnTopesCentroImageUrl,
             String reportHostLabel) {
         this.smtpHost = smtpHost;
         this.smtpPort = smtpPort;
@@ -67,7 +85,10 @@ final class Config {
         this.telegram = telegram;
         this.telegramForecastConfig = telegramForecastConfig;
         this.telegramSummariesConfig = telegramSummariesConfig;
+        this.telegramValidationConfig = telegramValidationConfig;
         this.telegramCommandsBotToken = telegramCommandsBotToken;
+        this.telegramImageBotToken = telegramImageBotToken;
+        this.smnTopesCentroImageUrl = smnTopesCentroImageUrl;
         this.reportHostLabel = reportHostLabel;
     }
 
@@ -147,6 +168,7 @@ final class Config {
         Telegram telegram = parseTelegram(fileProps);
         Telegram telegramForecastConfig = parseForecastTelegram(fileProps, telegram);
         Telegram telegramSummariesConfig = parseSummariesTelegram(fileProps, telegram);
+        Telegram telegramValidationConfig = parseValidationTelegram(fileProps, telegram);
 
         String commandsToken =
                 firstNonBlank(System.getenv("TELEGRAM_COMMANDS_BOT_TOKEN"), null, fileProps, "telegram.commands.bot.token");
@@ -154,6 +176,22 @@ final class Config {
             commandsToken = normalizeTelegramBotToken(commandsToken.trim());
         } else {
             commandsToken = null;
+        }
+
+        String imageBotToken =
+                firstNonBlank(System.getenv("TELEGRAM_IMAGE_BOT_TOKEN"), null, fileProps, "telegram.image.bot.token");
+        if (imageBotToken != null && !imageBotToken.isBlank()) {
+            imageBotToken = normalizeTelegramBotToken(imageBotToken.trim());
+        } else {
+            imageBotToken = null;
+        }
+
+        String topesUrl = firstNonBlank(System.getenv("SMN_TOPES_CENTRO_IMAGE_URL"), null, fileProps, "smn.topes.centro.image.url");
+        if (topesUrl != null) {
+            topesUrl = topesUrl.trim();
+            if (topesUrl.isEmpty()) {
+                topesUrl = null;
+            }
         }
 
         String reportHost = firstNonBlank(System.getenv("SMN_REPORT_HOST"), null, fileProps, "smn.report.host");
@@ -176,7 +214,10 @@ final class Config {
                 telegram,
                 telegramForecastConfig,
                 telegramSummariesConfig,
+                telegramValidationConfig,
                 commandsToken,
+                imageBotToken,
+                topesUrl,
                 reportHost);
     }
 
@@ -247,6 +288,46 @@ final class Config {
             if (main == null) {
                 throw new IllegalStateException(
                         "telegram.summaries.chat.ids is set but no bot token: set telegram.summaries.bot.token or telegram.bot.token.");
+            }
+            List<String> ids = splitCommaIds(chats);
+            if (ids.isEmpty()) {
+                return null;
+            }
+            return new Telegram(main.botToken(), Collections.unmodifiableList(ids));
+        }
+
+        return null;
+    }
+
+    /**
+     * Optional bot + chats for forecast-vs-observed validation (08:00 ART). Env {@code TELEGRAM_VALIDATION_BOT_TOKEN} /
+     * {@code TELEGRAM_VALIDATION_CHAT_IDS} or {@code telegram.validation.bot.token} / {@code telegram.validation.chat.ids}.
+     * If only chat ids are set, uses {@code telegram.bot.token} as the bot (requires main Telegram to be configured).
+     */
+    private static Telegram parseValidationTelegram(Properties fileProps, Telegram main) {
+        String token =
+                firstNonBlank(System.getenv("TELEGRAM_VALIDATION_BOT_TOKEN"), null, fileProps, "telegram.validation.bot.token");
+        String chats =
+                firstNonBlank(System.getenv("TELEGRAM_VALIDATION_CHAT_IDS"), null, fileProps, "telegram.validation.chat.ids");
+
+        if (token != null && !token.isBlank()) {
+            token = normalizeTelegramBotToken(token.trim());
+            if (chats == null || chats.isBlank()) {
+                throw new IllegalStateException(
+                        "telegram.validation.bot.token / TELEGRAM_VALIDATION_BOT_TOKEN is set; add telegram.validation.chat.ids "
+                                + "or TELEGRAM_VALIDATION_CHAT_IDS (numeric chat id(s), comma-separated).");
+            }
+            List<String> ids = splitCommaIds(chats);
+            if (ids.isEmpty()) {
+                throw new IllegalStateException("telegram.validation.chat.ids must list at least one chat id.");
+            }
+            return new Telegram(token, Collections.unmodifiableList(ids));
+        }
+
+        if (chats != null && !chats.isBlank()) {
+            if (main == null) {
+                throw new IllegalStateException(
+                        "telegram.validation.chat.ids is set but no bot token: set telegram.validation.bot.token or telegram.bot.token.");
             }
             List<String> ids = splitCommaIds(chats);
             if (ids.isEmpty()) {
@@ -447,11 +528,37 @@ final class Config {
         return telegramSummariesConfig != null ? telegramSummariesConfig : telegram;
     }
 
+    /** Nullable when validation uses the same routing as {@link #telegram()}. */
+    Telegram telegramValidationConfig() {
+        return telegramValidationConfig;
+    }
+
+    /**
+     * Bot + chats for forecast validation Telegram (08:00 ART). Uses dedicated config when set, otherwise
+     * {@link #telegram()}.
+     */
+    Telegram telegramForValidation() {
+        return telegramValidationConfig != null ? telegramValidationConfig : telegram;
+    }
+
     /**
      * Bot token for optional {@link TelegramBotCommandListener} ({@code getUpdates}). {@code null} when unset.
      */
     String telegramCommandsBotToken() {
         return telegramCommandsBotToken;
+    }
+
+    /**
+     * Bot token for {@code /image} → {@code sendPhoto} (delivery bot). {@code null} when unset; {@code /image} then
+     * replies with a short setup hint.
+     */
+    String telegramImageBotToken() {
+        return telegramImageBotToken;
+    }
+
+    /** Optional direct URL for the centro topes image; {@code null} to resolve via SMN API. */
+    String smnTopesCentroImageUrl() {
+        return smnTopesCentroImageUrl;
     }
 
     /** Nullable explicit label for {@code (host)} footer in condition messages. */
@@ -504,8 +611,17 @@ final class Config {
                                         && telegramSummariesConfig.botToken().equals(telegram.botToken())
                                 ? "otherChats"
                                 : "otherBot"))
+                + ", validation="
+                + (telegramValidationConfig == null
+                        ? "same"
+                        : (telegram != null
+                                        && telegramValidationConfig.botToken().equals(telegram.botToken())
+                                ? "otherChats"
+                                : "otherBot"))
                 + ", commandsBot="
                 + (telegramCommandsBotToken != null ? "on" : "off")
+                + ", imageBot="
+                + (telegramImageBotToken != null ? "on" : "off")
                 + "}";
     }
 }

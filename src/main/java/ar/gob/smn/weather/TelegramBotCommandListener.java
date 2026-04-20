@@ -11,13 +11,16 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
  * Long-polls {@code getUpdates} for a dedicated bot token and handles slash commands (e.g. {@code /hello}).
- * Replies via {@code sendMessage} to the chat that issued the command.
+ * Replies via {@code sendMessage} to the chat that issued the command. Optional {@code /image} uses a second bot token
+ * to {@code sendPhoto} (user must have started that bot too).
  */
 final class TelegramBotCommandListener implements Runnable {
 
@@ -30,10 +33,22 @@ final class TelegramBotCommandListener implements Runnable {
     private final String botToken;
     /** Same label as condition/forecast footers ({@code smn.report.host} / hostname). */
     private final String reportHost;
+    /** Nullable: delivery bot for {@code /image}. */
+    private final String imageDeliveryBotToken;
+    /** Nullable: direct SMN image URL override. */
+    private final String smnTopesCentroImageUrl;
+    private final SmnTopesCentroImageFetcher topesFetcher = new SmnTopesCentroImageFetcher();
+    private final TelegramPhotoSender photoSender = new TelegramPhotoSender();
 
-    TelegramBotCommandListener(String botToken, String reportHost) {
+    TelegramBotCommandListener(String botToken, String reportHost, String imageDeliveryBotToken, String smnTopesCentroImageUrl) {
         this.botToken = botToken;
         this.reportHost = reportHost != null && !reportHost.isBlank() ? reportHost.trim() : "unknown-host";
+        this.imageDeliveryBotToken = imageDeliveryBotToken != null && !imageDeliveryBotToken.isBlank()
+                ? imageDeliveryBotToken.trim()
+                : null;
+        this.smnTopesCentroImageUrl = smnTopesCentroImageUrl != null && !smnTopesCentroImageUrl.isBlank()
+                ? smnTopesCentroImageUrl.trim()
+                : null;
     }
 
     @Override
@@ -106,6 +121,55 @@ final class TelegramBotCommandListener implements Runnable {
                     Thread.currentThread().interrupt();
                 }
                 LOG.log(Level.WARNING, "Telegram /hello reply failed: " + e.getMessage(), e);
+            }
+            return;
+        }
+        if (isCommand(text, "/image")) {
+            if (imageDeliveryBotToken == null) {
+                try {
+                    sendMessage(
+                            chatId,
+                            "Configure telegram.image.bot.token (env TELEGRAM_IMAGE_BOT_TOKEN) para enviar la imagen con un"
+                                    + " segundo bot.");
+                } catch (IOException | InterruptedException e) {
+                    if (e instanceof InterruptedException) {
+                        Thread.currentThread().interrupt();
+                    }
+                    LOG.log(Level.WARNING, "Telegram /image hint failed: " + e.getMessage(), e);
+                }
+                return;
+            }
+            Path tmp = null;
+            try {
+                tmp = topesFetcher.downloadToTempFile(smnTopesCentroImageUrl);
+                String name = tmp.getFileName().toString();
+                photoSender.sendPhoto(
+                        imageDeliveryBotToken,
+                        chatId,
+                        tmp,
+                        name,
+                        "Topes nubosos — zona centro (SMN)\n" + reportHost);
+            } catch (IOException | InterruptedException e) {
+                if (e instanceof InterruptedException) {
+                    Thread.currentThread().interrupt();
+                }
+                LOG.log(Level.WARNING, "Telegram /image failed: " + e.getMessage(), e);
+                try {
+                    sendMessage(chatId, "No se pudo enviar la imagen: " + e.getMessage());
+                } catch (IOException | InterruptedException e2) {
+                    if (e2 instanceof InterruptedException) {
+                        Thread.currentThread().interrupt();
+                    }
+                    LOG.log(Level.WARNING, "Telegram /image error reply failed: " + e2.getMessage(), e2);
+                }
+            } finally {
+                if (tmp != null) {
+                    try {
+                        Files.deleteIfExists(tmp);
+                    } catch (IOException ignored) {
+                        // best-effort cleanup
+                    }
+                }
             }
         }
     }

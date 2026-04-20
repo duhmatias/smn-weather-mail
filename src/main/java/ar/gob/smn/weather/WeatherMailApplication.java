@@ -90,6 +90,10 @@ public final class WeatherMailApplication {
         MailSender mail = new MailSender(config);
         TelegramNotifier telegramConditions =
                 config.telegram() != null ? new TelegramNotifier(config.telegram()) : null;
+        TelegramNotifier telegramForecastValidation =
+                config.telegramForValidation() != null
+                        ? new TelegramNotifier(config.telegramForValidation())
+                        : null;
         TelegramNotifier telegramForecast =
                 config.telegramForForecast() != null ? new TelegramNotifier(config.telegramForForecast()) : null;
         TelegramNotifier telegramMeasuresSummary =
@@ -126,7 +130,7 @@ public final class WeatherMailApplication {
         LOG.info(() -> "Forecast day snapshots: "
                 + forecastHistoryDir.resolve("forecast-day-snapshots.log").toAbsolutePath());
         LOG.info(() -> "Forecast validation dedupe: " + forecastValidationSentPath.toAbsolutePath()
-                + " (08:00 ART previous day vs first forecast JSON logged)");
+                + " (08:00 ART previous day vs all forecast JSON snapshots logged for that day)");
         LOG.info(() -> "Historical month archive: state "
                 + historicalArchiveStatePath.toAbsolutePath()
                 + " | zip dir "
@@ -135,6 +139,15 @@ public final class WeatherMailApplication {
         LOG.info(() -> "Recipients: " + config.recipients() + " | zone: " + BUENOS_AIRES + " | poll: " + POLL_INTERVAL
                 + " (2m through :19, 5m from :20 if hourly bulletin still pending) | pause between stations: "
                 + SLEEP_BETWEEN_STATIONS);
+        if (telegramForecastValidation != null) {
+            boolean valDedicated = config.telegramValidationConfig() != null;
+            LOG.info(() -> "Telegram (forecast validation): "
+                    + config.telegramForValidation().chatIds().size()
+                    + " chat(s)"
+                    + (valDedicated
+                            ? " — telegram.validation.bot.token / TELEGRAM_VALIDATION_BOT_TOKEN"
+                            : " — same bot as conditions (telegram.bot.token)"));
+        }
         if (telegramConditions != null) {
             LOG.info(() -> "Telegram (conditions): " + config.telegram().chatIds().size() + " chat(s)");
             if (config.telegramForecastConfig() != null) {
@@ -162,10 +175,18 @@ public final class WeatherMailApplication {
         String commandsBotToken = config.telegramCommandsBotToken();
         if (commandsBotToken != null && !commandsBotToken.isBlank()) {
             Thread cmdThread =
-                    new Thread(new TelegramBotCommandListener(commandsBotToken, reportHost), "telegram-commands");
+                    new Thread(
+                            new TelegramBotCommandListener(
+                                    commandsBotToken,
+                                    reportHost,
+                                    config.telegramImageBotToken(),
+                                    config.smnTopesCentroImageUrl()),
+                            "telegram-commands");
             cmdThread.setDaemon(true);
             cmdThread.start();
-            LOG.info("Telegram command listener: on (getUpdates /hello → world! + host line)");
+            LOG.info(
+                    "Telegram command listener: on (getUpdates /hello; /image → SMN topes centro si"
+                            + " telegram.image.bot.token está definido)");
         }
 
         tryCatchUpMissingForecastTelegramOnStartup(
@@ -187,7 +208,7 @@ public final class WeatherMailApplication {
                 configIncludesCaba,
                 config,
                 mail,
-                telegramConditions,
+                telegramForecastValidation,
                 reportHost);
 
         HistoricalMonthArchive.validateStateOnStartup(historicalArchiveStatePath, BUENOS_AIRES);
@@ -204,7 +225,7 @@ public final class WeatherMailApplication {
                     configIncludesCaba,
                     config,
                     mail,
-                    telegramConditions,
+                    telegramForecastValidation,
                     reportHost);
             ZonedDateTime nowHourArt = ZonedDateTime.now(BUENOS_AIRES).truncatedTo(ChronoUnit.HOURS);
             for (int i = 0; i < stations.size(); i++) {
@@ -919,7 +940,7 @@ public final class WeatherMailApplication {
             boolean configIncludesCaba,
             Config config,
             MailSender mail,
-            TelegramNotifier telegramConditions,
+            TelegramNotifier telegramForecastValidation,
             String reportHost) {
         if (!configIncludesCaba) {
             return;
@@ -938,7 +959,7 @@ public final class WeatherMailApplication {
                     sent,
                     config,
                     mail,
-                    telegramConditions,
+                    telegramForecastValidation,
                     reportHost,
                     "startup catch-up");
         } catch (IOException e) {
@@ -947,8 +968,8 @@ public final class WeatherMailApplication {
     }
 
     /**
-     * Daily 08:00–08:29 ART: compare yesterday’s CABA measures (min/max, rain) with the earliest SMN JSON snapshot
-     * that included that calendar day (see {@link ForecastDaySnapshotLog}).
+     * Daily 08:00–08:29 ART: compare yesterday’s CABA measures (min/max, rain) with every SMN JSON snapshot logged
+     * that included that calendar day in {@code forecast} (see {@link ForecastDaySnapshotLog#findAllSnapshots}).
      */
     private static void trySendForecastValidation(
             Path measuresDir,
@@ -957,7 +978,7 @@ public final class WeatherMailApplication {
             boolean configIncludesCaba,
             Config config,
             MailSender mail,
-            TelegramNotifier telegramConditions,
+            TelegramNotifier telegramForecastValidation,
             String reportHost) {
         if (!configIncludesCaba) {
             return;
@@ -975,7 +996,7 @@ public final class WeatherMailApplication {
                     sent,
                     config,
                     mail,
-                    telegramConditions,
+                    telegramForecastValidation,
                     reportHost,
                     "scheduled");
         } catch (IOException e) {
@@ -989,7 +1010,7 @@ public final class WeatherMailApplication {
             MeasuresSummarySentLog sent,
             Config config,
             MailSender mail,
-            TelegramNotifier telegramConditions,
+            TelegramNotifier telegramForecastValidation,
             String reportHost,
             String logMode) {
         LocalDate today = ZonedDateTime.now(BUENOS_AIRES).toLocalDate();
@@ -1010,16 +1031,16 @@ public final class WeatherMailApplication {
                     break;
                 }
             }
-            Optional<ForecastDaySnapshotLog.SnapshotRow> firstForecast =
-                    snapshotLog.findFirstSnapshot(dataDay, CABA_LOCATION_ID);
+            List<ForecastDaySnapshotLog.SnapshotRow> forecastSnapshots =
+                    snapshotLog.findAllSnapshots(dataDay, CABA_LOCATION_ID);
             String subj = ForecastValidationMessages.subject(dataDay);
             String html =
                     ForecastValidationMessages.buildEmailHtml(
-                            caba.label(), dataDay, observed, observedRain, firstForecast, reportHost);
+                            caba.label(), dataDay, observed, observedRain, forecastSnapshots, reportHost);
             String tg =
                     ForecastValidationMessages.buildTelegramHtml(
-                            caba.label(), dataDay, observed, observedRain, firstForecast, reportHost);
-            if (sendForecastValidationMailTelegram(config, mail, telegramConditions, subj, html, tg, reportHost)) {
+                            caba.label(), dataDay, observed, observedRain, forecastSnapshots, reportHost);
+            if (sendForecastValidationMailTelegram(config, mail, telegramForecastValidation, subj, html, tg, reportHost)) {
                 try {
                     sent.record(key);
                     if ("startup catch-up".equals(logMode)) {
@@ -1037,7 +1058,7 @@ public final class WeatherMailApplication {
     private static boolean sendForecastValidationMailTelegram(
             Config config,
             MailSender mail,
-            TelegramNotifier telegramConditions,
+            TelegramNotifier telegramForecastValidation,
             String subject,
             String htmlEmail,
             String telegramHtml,
@@ -1053,9 +1074,9 @@ public final class WeatherMailApplication {
             LOG.log(Level.WARNING, "Forecast validation email failed: " + subject, e);
             return false;
         }
-        if (telegramConditions != null && telegramHtml != null && !telegramHtml.isBlank()) {
+        if (telegramForecastValidation != null && telegramHtml != null && !telegramHtml.isBlank()) {
             try {
-                telegramConditions.sendHtml(telegramHtml.trim());
+                telegramForecastValidation.sendHtml(telegramHtml.trim());
             } catch (Exception e) {
                 LOG.log(Level.WARNING, "Forecast validation Telegram failed: " + subject, e);
             }

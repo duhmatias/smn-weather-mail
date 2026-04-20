@@ -2,6 +2,7 @@ package ar.gob.smn.weather;
 
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
+import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
 
@@ -10,6 +11,8 @@ final class ForecastValidationMessages {
 
     private static final Locale ES_AR = Locale.forLanguageTag("es-AR");
     private static final DateTimeFormatter DAY = DateTimeFormatter.ofPattern("EEEE d MMM uuuu", ES_AR);
+    /** Leave margin under Telegram’s 4096 limit for {@code sendHtml}. */
+    private static final int TELEGRAM_BODY_BUDGET = 3800;
 
     private ForecastValidationMessages() {}
 
@@ -22,7 +25,7 @@ final class ForecastValidationMessages {
             LocalDate dataDay,
             Optional<MeasuresSummaryMessages.TempPeriod> observed,
             boolean observedRain,
-            Optional<ForecastDaySnapshotLog.SnapshotRow> firstForecast,
+            List<ForecastDaySnapshotLog.SnapshotRow> forecastSnapshots,
             String reportHost) {
         String h = esc(reportHost);
         StringBuilder sb = new StringBuilder();
@@ -42,28 +45,35 @@ final class ForecastValidationMessages {
         }
         sb.append("<p>Lluvia (condiciones reportadas): ").append(observedRain ? "sí" : "no").append("</p>\n");
 
-        sb.append("<h3>Pronóstico (primera aparición de ese día en JSON SMN guardado por esta app)</h3>\n");
-        if (firstForecast.isPresent()) {
-            ForecastDaySnapshotLog.SnapshotRow f = firstForecast.get();
-            sb.append("<p>Registrado (ART): ").append(esc(f.writtenArt().toString())).append("</p>\n");
-            if (!f.smnUpdated().isBlank()) {
-                sb.append("<p>SMN <code>updated</code>: ").append(esc(f.smnUpdated())).append("</p>\n");
-            }
-            sb.append("<p><code>temp_min</code> / <code>temp_max</code> del boletín: ")
-                    .append(ForecastDaySnapshotLog.fmtTemp(f.tempMin()))
-                    .append(" / ")
-                    .append(ForecastDaySnapshotLog.fmtTemp(f.tempMax()))
-                    .append("</p>\n");
-            sb.append("<p>Máx. probabilidad de lluvia (tope de rangos por período): ")
-                    .append(f.maxRainUpper())
-                    .append(" %</p>\n");
-        } else {
+        sb.append("<h3>Pronóstico (todos los boletines SMN guardados que incluían ese día)</h3>\n");
+        if (forecastSnapshots.isEmpty()) {
             sb.append("<p><i>No hay en el historial local ningún JSON SMN que incluya ese día. ")
                     .append("Hace falta haber corrido este servicio cuando SMN ya exponía ese día en el pronóstico.</i></p>\n");
+        } else {
+            sb.append("<p>")
+                    .append(forecastSnapshots.size())
+                    .append(" registro(s), en orden cronológico (cuando se guardó cada JSON).</p>\n");
+            sb.append("<ol>\n");
+            for (ForecastDaySnapshotLog.SnapshotRow f : forecastSnapshots) {
+                sb.append("<li><p>Registrado (ART): ").append(esc(f.writtenArt().toString())).append("</p>\n");
+                if (!f.smnUpdated().isBlank()) {
+                    sb.append("<p>SMN <code>updated</code>: ").append(esc(f.smnUpdated())).append("</p>\n");
+                }
+                sb.append("<p><code>temp_min</code> / <code>temp_max</code>: ")
+                        .append(ForecastDaySnapshotLog.fmtTemp(f.tempMin()))
+                        .append(" / ")
+                        .append(ForecastDaySnapshotLog.fmtTemp(f.tempMax()))
+                        .append("</p>\n");
+                sb.append("<p>Máx. probabilidad de lluvia (tope de rangos por período): ")
+                        .append(f.maxRainUpper())
+                        .append(" %</p></li>\n");
+            }
+            sb.append("</ol>\n");
         }
 
         sb.append("<p style=\"color:#555;font-size:90%\">")
-                .append("Comparación orientativa; el pronóstico citado es el primero almacenado mientras corrían los envíos.")
+                .append("Comparación orientativa; se listan todos los pronósticos almacenados por esta app ")
+                .append("en los que SMN incluía ese día en el array <code>forecast</code>.")
                 .append("</p>\n");
         sb.append("<p>(").append(h).append(")</p>\n");
         return sb.toString();
@@ -74,7 +84,7 @@ final class ForecastValidationMessages {
             LocalDate dataDay,
             Optional<MeasuresSummaryMessages.TempPeriod> observed,
             boolean observedRain,
-            Optional<ForecastDaySnapshotLog.SnapshotRow> firstForecast,
+            List<ForecastDaySnapshotLog.SnapshotRow> forecastSnapshots,
             String reportHost) {
         String h = escTg(reportHost);
         StringBuilder sb = new StringBuilder();
@@ -94,25 +104,56 @@ final class ForecastValidationMessages {
         }
         sb.append("Lluvia: ").append(observedRain ? "sí" : "no").append("\n\n");
 
-        sb.append("<b>Pronóstico (primera aparición en historial)</b>\n");
-        if (firstForecast.isPresent()) {
-            ForecastDaySnapshotLog.SnapshotRow f = firstForecast.get();
-            sb.append("Registrado: ").append(escTg(f.writtenArt().toString())).append("\n");
-            if (!f.smnUpdated().isBlank()) {
-                sb.append("updated: ").append(escTg(f.smnUpdated())).append("\n");
-            }
-            sb.append("min / max: ")
-                    .append(ForecastDaySnapshotLog.fmtTemp(f.tempMin()))
-                    .append(" / ")
-                    .append(ForecastDaySnapshotLog.fmtTemp(f.tempMax()))
-                    .append("\n");
-            sb.append("Máx. prob. lluvia: ").append(f.maxRainUpper()).append(" %\n");
-        } else {
+        sb.append("<b>Pronóstico (todos los que incluían ese día)</b>\n");
+        if (forecastSnapshots.isEmpty()) {
             sb.append("(Sin datos en historial local.)\n");
+        } else {
+            int shown = appendTelegramSnapshots(sb, forecastSnapshots);
+            if (shown == 0) {
+                sb.append("(Lista larga — ver correo para todos los ")
+                        .append(forecastSnapshots.size())
+                        .append(" boletines.)\n");
+            } else if (shown < forecastSnapshots.size()) {
+                sb.append("\n… (+")
+                        .append(forecastSnapshots.size() - shown)
+                        .append(" más en el correo)\n");
+            }
         }
 
         sb.append("\n(").append(h).append(")");
-        return sb.toString();
+        String out = sb.toString();
+        if (out.length() > TELEGRAM_BODY_BUDGET) {
+            return out.substring(0, TELEGRAM_BODY_BUDGET - 20) + "\n…(truncado)";
+        }
+        return out;
+    }
+
+    /**
+     * Appends numbered snapshot blocks until adding another would exceed budget. Returns count appended.
+     */
+    private static int appendTelegramSnapshots(StringBuilder sb, List<ForecastDaySnapshotLog.SnapshotRow> forecasts) {
+        int shown = 0;
+        for (int i = 0; i < forecasts.size(); i++) {
+            ForecastDaySnapshotLog.SnapshotRow f = forecasts.get(i);
+            StringBuilder block = new StringBuilder();
+            block.append(i + 1)
+                    .append(") ")
+                    .append(escTg(f.writtenArt().toString()));
+            if (!f.smnUpdated().isBlank()) {
+                block.append(" · upd ").append(escTg(f.smnUpdated()));
+            }
+            block.append("\n   min/max ")
+                    .append(ForecastDaySnapshotLog.fmtTemp(f.tempMin()))
+                    .append(" / ")
+                    .append(ForecastDaySnapshotLog.fmtTemp(f.tempMax()));
+            block.append(" · lluvia ≤").append(f.maxRainUpper()).append("%\n");
+            if (sb.length() + block.length() > TELEGRAM_BODY_BUDGET) {
+                break;
+            }
+            sb.append(block);
+            shown++;
+        }
+        return shown;
     }
 
     private static String fmt(double t) {

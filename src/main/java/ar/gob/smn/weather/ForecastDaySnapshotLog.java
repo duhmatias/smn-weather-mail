@@ -20,7 +20,7 @@ import java.util.Optional;
 
 /**
  * Append-only log of per-day forecast stats extracted from SMN JSON each time we store a bulletin (email or
- * Telegram). Used to find the <em>earliest</em> snapshot where a calendar day appeared in the API response.
+ * Telegram). Used to list every stored snapshot where a calendar day appeared in the API response.
  */
 final class ForecastDaySnapshotLog {
 
@@ -80,11 +80,12 @@ final class ForecastDaySnapshotLog {
     }
 
     /**
-     * Earliest snapshot line for {@code targetDay} and {@code locationId}, by {@code writtenArt}.
+     * All snapshot lines for {@code targetDay} and {@code locationId}, ordered by {@code writtenArt} (chronological).
+     * Each line is one SMN JSON fetch where that calendar day appeared in the {@code forecast} array.
      */
-    Optional<SnapshotRow> findFirstSnapshot(LocalDate targetDay, int locationId) throws IOException {
+    List<SnapshotRow> findAllSnapshots(LocalDate targetDay, int locationId) throws IOException {
         if (!Files.isRegularFile(file)) {
-            return Optional.empty();
+            return Collections.emptyList();
         }
         List<SnapshotRow> matches = new ArrayList<>();
         for (String line : Files.readAllLines(file, StandardCharsets.UTF_8)) {
@@ -97,11 +98,8 @@ final class ForecastDaySnapshotLog {
                 matches.add(r);
             }
         }
-        if (matches.isEmpty()) {
-            return Optional.empty();
-        }
         matches.sort(Comparator.comparing(SnapshotRow::writtenArt));
-        return Optional.of(matches.get(0));
+        return Collections.unmodifiableList(matches);
     }
 
     private static Optional<SnapshotRow> parseLine(String line) {
