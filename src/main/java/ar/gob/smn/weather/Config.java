@@ -29,6 +29,11 @@ final class Config {
      * When {@code null}, {@link #telegramForForecast()} uses {@link #telegram()}.
      */
     private final Telegram telegramForecastConfig;
+    /**
+     * Nullable measures-summary routing (daily/weekly/monthly). When {@code null}, {@link #telegramForMeasuresSummaries()}
+     * uses {@link #telegram()}.
+     */
+    private final Telegram telegramSummariesConfig;
     /** Nullable: {@code SMN_REPORT_HOST} / {@code smn.report.host} for message footer; else OS hostname. */
     private final String reportHostLabel;
 
@@ -43,6 +48,7 @@ final class Config {
             List<String> recipients,
             Telegram telegram,
             Telegram telegramForecastConfig,
+            Telegram telegramSummariesConfig,
             String reportHostLabel) {
         this.smtpHost = smtpHost;
         this.smtpPort = smtpPort;
@@ -54,6 +60,7 @@ final class Config {
         this.recipients = recipients;
         this.telegram = telegram;
         this.telegramForecastConfig = telegramForecastConfig;
+        this.telegramSummariesConfig = telegramSummariesConfig;
         this.reportHostLabel = reportHostLabel;
     }
 
@@ -132,6 +139,7 @@ final class Config {
         List<String> recipients = parseRecipients(fileProps);
         Telegram telegram = parseTelegram(fileProps);
         Telegram telegramForecastConfig = parseForecastTelegram(fileProps, telegram);
+        Telegram telegramSummariesConfig = parseSummariesTelegram(fileProps, telegram);
 
         String reportHost = firstNonBlank(System.getenv("SMN_REPORT_HOST"), null, fileProps, "smn.report.host");
         if (reportHost != null) {
@@ -141,7 +149,8 @@ final class Config {
             }
         }
 
-        return new Config(host, port, user, password, from, startTls, ssl, recipients, telegram, telegramForecastConfig, reportHost);
+        return new Config(
+                host, port, user, password, from, startTls, ssl, recipients, telegram, telegramForecastConfig, telegramSummariesConfig, reportHost);
     }
 
     /**
@@ -173,6 +182,46 @@ final class Config {
 
         if (forecastChats != null && !forecastChats.isBlank()) {
             List<String> ids = splitCommaIds(forecastChats);
+            if (ids.isEmpty()) {
+                return null;
+            }
+            return new Telegram(main.botToken(), Collections.unmodifiableList(ids));
+        }
+
+        return null;
+    }
+
+    /**
+     * Optional bot + chats for measures summaries (daily/weekly/monthly). Env {@code TELEGRAM_SUMMARIES_BOT_TOKEN} /
+     * {@code TELEGRAM_SUMMARIES_CHAT_IDS} or {@code telegram.summaries.bot.token} / {@code telegram.summaries.chat.ids}.
+     * If only chat ids are set, uses {@code telegram.bot.token} as the bot (requires main Telegram to be configured).
+     */
+    private static Telegram parseSummariesTelegram(Properties fileProps, Telegram main) {
+        String token =
+                firstNonBlank(System.getenv("TELEGRAM_SUMMARIES_BOT_TOKEN"), null, fileProps, "telegram.summaries.bot.token");
+        String chats =
+                firstNonBlank(System.getenv("TELEGRAM_SUMMARIES_CHAT_IDS"), null, fileProps, "telegram.summaries.chat.ids");
+
+        if (token != null && !token.isBlank()) {
+            token = normalizeTelegramBotToken(token.trim());
+            if (chats == null || chats.isBlank()) {
+                throw new IllegalStateException(
+                        "telegram.summaries.bot.token / TELEGRAM_SUMMARIES_BOT_TOKEN is set; add telegram.summaries.chat.ids "
+                                + "or TELEGRAM_SUMMARIES_CHAT_IDS (numeric chat id(s), comma-separated).");
+            }
+            List<String> ids = splitCommaIds(chats);
+            if (ids.isEmpty()) {
+                throw new IllegalStateException("telegram.summaries.chat.ids must list at least one chat id.");
+            }
+            return new Telegram(token, Collections.unmodifiableList(ids));
+        }
+
+        if (chats != null && !chats.isBlank()) {
+            if (main == null) {
+                throw new IllegalStateException(
+                        "telegram.summaries.chat.ids is set but no bot token: set telegram.summaries.bot.token or telegram.bot.token.");
+            }
+            List<String> ids = splitCommaIds(chats);
             if (ids.isEmpty()) {
                 return null;
             }
@@ -358,6 +407,19 @@ final class Config {
         return telegramForecastConfig;
     }
 
+    /** Nullable when measures summaries use the same routing as {@link #telegram()}. */
+    Telegram telegramSummariesConfig() {
+        return telegramSummariesConfig;
+    }
+
+    /**
+     * Bot + chats for measures summary Telegram (daily/weekly/monthly). Uses dedicated config when set, otherwise
+     * {@link #telegram()}.
+     */
+    Telegram telegramForMeasuresSummaries() {
+        return telegramSummariesConfig != null ? telegramSummariesConfig : telegram;
+    }
+
     /** Nullable explicit label for {@code (host)} footer in condition messages. */
     String reportHostLabel() {
         return reportHostLabel;
@@ -401,6 +463,13 @@ final class Config {
                 + (telegram != null && telegramForecastConfig != null
                         ? (telegramForecastConfig.botToken().equals(telegram.botToken()) ? "otherChats" : "otherBot")
                         : "same")
+                + ", summaries="
+                + (telegramSummariesConfig == null
+                        ? "same"
+                        : (telegram != null
+                                        && telegramSummariesConfig.botToken().equals(telegram.botToken())
+                                ? "otherChats"
+                                : "otherBot"))
                 + "}";
     }
 }

@@ -3,6 +3,8 @@ package ar.gob.smn.weather;
 import jakarta.mail.Message;
 import jakarta.mail.Session;
 import jakarta.mail.Transport;
+import jakarta.mail.internet.MimeBodyPart;
+import jakarta.mail.internet.MimeMultipart;
 import jakarta.mail.internet.InternetAddress;
 import jakarta.mail.internet.MimeMessage;
 
@@ -55,6 +57,63 @@ final class MailSender {
 
         String mode = config.smtpSsl() ? "SSL" : (config.smtpStartTls() ? "STARTTLS" : "plain");
         LOG.info(() -> "Sending mail via " + config.smtpHost() + ":" + config.smtpPort()
+                + " (" + mode + ") from " + config.fromAddress() + " to " + to);
+
+        try (Transport transport = session.getTransport("smtp")) {
+            transport.connect(config.smtpHost(), config.smtpPort(), config.smtpUser(), config.smtpPassword());
+            transport.sendMessage(msg, msg.getAllRecipients());
+        }
+    }
+
+    /**
+     * Same as {@link #send} but attaches a UTF-8 plain-text alternative (e.g. measures summaries identical to
+     * Telegram wording) alongside HTML.
+     */
+    void sendHtmlWithPlain(List<String> to, String subject, String plainText, String htmlBody) throws Exception {
+        Properties props = new Properties();
+        props.put("mail.smtp.host", config.smtpHost());
+        props.put("mail.smtp.port", String.valueOf(config.smtpPort()));
+        props.put("mail.smtp.auth", "true");
+
+        if (config.smtpSsl()) {
+            props.put("mail.smtp.ssl.enable", "true");
+            props.put("mail.smtp.ssl.trust", config.smtpHost());
+            props.put("mail.smtp.socketFactory.port", String.valueOf(config.smtpPort()));
+            props.put("mail.smtp.socketFactory.class", "javax.net.ssl.SSLSocketFactory");
+            props.put("mail.smtp.socketFactory.fallback", "false");
+        } else if (config.smtpStartTls()) {
+            props.put("mail.smtp.starttls.enable", "true");
+            props.put("mail.smtp.starttls.required", "true");
+        }
+
+        Session session = Session.getInstance(props, null);
+
+        if (to.isEmpty()) {
+            throw new IllegalArgumentException("At least one recipient required");
+        }
+        InternetAddress[] recipients = new InternetAddress[to.size()];
+        for (int i = 0; i < to.size(); i++) {
+            recipients[i] = new InternetAddress(to.get(i).trim());
+        }
+
+        MimeBodyPart plainPart = new MimeBodyPart();
+        plainPart.setText(plainText == null ? "" : plainText, "UTF-8");
+
+        MimeBodyPart htmlPart = new MimeBodyPart();
+        htmlPart.setContent(htmlBody, "text/html; charset=UTF-8");
+
+        MimeMultipart alt = new MimeMultipart("alternative");
+        alt.addBodyPart(plainPart);
+        alt.addBodyPart(htmlPart);
+
+        MimeMessage msg = new MimeMessage(session);
+        msg.setFrom(new InternetAddress(config.fromAddress()));
+        msg.setRecipients(Message.RecipientType.TO, recipients);
+        msg.setSubject(subject, "UTF-8");
+        msg.setContent(alt);
+
+        String mode = config.smtpSsl() ? "SSL" : (config.smtpStartTls() ? "STARTTLS" : "plain");
+        LOG.info(() -> "Sending multipart mail via " + config.smtpHost() + ":" + config.smtpPort()
                 + " (" + mode + ") from " + config.fromAddress() + " to " + to);
 
         try (Transport transport = session.getTransport("smtp")) {

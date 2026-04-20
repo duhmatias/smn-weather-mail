@@ -1,4 +1,5 @@
 config.properties
+run_local.env
 smn-weather-sent.txt
 smn-measures/
 target/

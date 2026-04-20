@@ -6,8 +6,10 @@ import java.net.UnknownHostException;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.DayOfWeek;
 import java.time.LocalDate;
 import java.time.LocalTime;
+import java.time.YearMonth;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
@@ -17,6 +19,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -47,6 +50,7 @@ public final class WeatherMailApplication {
     private static final String DEFAULT_FORECAST_SENT_FILE = "smn-forecast-sent.txt";
     private static final String DEFAULT_MEASURES_DIR = "smn-measures";
     private static final String DEFAULT_FORECAST_HISTORY_DIR = "smn-forecast-history";
+    private static final String DEFAULT_MEASURES_SUMMARY_SENT = "smn-measures-summary-sent.txt";
     private static final String FH_SRC_EMAIL = "OBS_EMAIL";
     private static final String FH_TG_MORNING = "TG_MORNING";
     private static final String FH_TG_AFTERNOON = "TG_AFTERNOON";
@@ -84,7 +88,11 @@ public final class WeatherMailApplication {
         TelegramNotifier telegramConditions =
                 config.telegram() != null ? new TelegramNotifier(config.telegram()) : null;
         TelegramNotifier telegramForecast =
-                config.telegram() != null ? new TelegramNotifier(config.telegramForForecast()) : null;
+                config.telegramForForecast() != null ? new TelegramNotifier(config.telegramForForecast()) : null;
+        TelegramNotifier telegramMeasuresSummary =
+                config.telegramForMeasuresSummaries() != null
+                        ? new TelegramNotifier(config.telegramForMeasuresSummaries())
+                        : null;
 
         List<SmnClient.Station> stations = stationsFromEnv();
         Path sentLogPath = sentLogPathFromEnv();
@@ -94,6 +102,7 @@ public final class WeatherMailApplication {
         Map<Integer, ZonedDateTime> lastMailedObsHourArt =
                 new HashMap<>(sent.latestMailedObservationHourPerLocation(BUENOS_AIRES));
         Path measuresDir = measuresDirFromEnv();
+        Path measuresSummarySentPath = measuresSummarySentPathFromEnv();
         MeasuresDailyLog measures = new MeasuresDailyLog(measuresDir);
         Path forecastHistoryDir = forecastHistoryDirFromEnv();
         ForecastDailyLog forecastHistory = new ForecastDailyLog(forecastHistoryDir);
@@ -103,6 +112,8 @@ public final class WeatherMailApplication {
         LOG.info(() -> "Sent log (dedupe): " + sentLogPath.toAbsolutePath());
         LOG.info(() -> "Forecast Telegram dedupe: " + forecastSentPath.toAbsolutePath());
         LOG.info(() -> "Measures dir: " + measuresDir.toAbsolutePath() + " (YYYY/MM/<day>.txt)");
+        LOG.info(() -> "Measures summary dedupe: " + measuresSummarySentPath.toAbsolutePath()
+                + " (daily 08:00 ART previous day; Mon 08:00 previous week; 1st 08:00 previous month)");
         LOG.info(() -> "Forecast history dir: " + forecastHistoryDir.toAbsolutePath() + " (YYYY/MM/<day>.txt)");
         LOG.info(() -> "Recipients: " + config.recipients() + " | zone: " + BUENOS_AIRES + " | poll: " + POLL_INTERVAL
                 + " (2m through :19, 5m from :20 if hourly bulletin still pending) | pause between stations: "
@@ -118,6 +129,15 @@ public final class WeatherMailApplication {
                         + (otherBot ? " — separate bot (telegram.forecast.bot.token)" : " — same bot, different chats"));
             }
         }
+        if (telegramMeasuresSummary != null) {
+            boolean dedicated = config.telegramSummariesConfig() != null;
+            LOG.info(() -> "Telegram (measures summaries): "
+                    + config.telegramForMeasuresSummaries().chatIds().size()
+                    + " chat(s)"
+                    + (dedicated
+                            ? " — telegram.summaries.bot.token / TELEGRAM_SUMMARIES_BOT_TOKEN"
+                            : " — same bot as conditions (telegram.bot.token)"));
+        }
 
         String reportHost = resolveReportHostLabel(config);
         LOG.info(() -> "Condition messages host footer: " + reportHost + " (smn.report.host / SMN_REPORT_HOST / HOSTNAME)");
@@ -125,7 +145,12 @@ public final class WeatherMailApplication {
         tryCatchUpMissingForecastTelegramOnStartup(
                 smn, telegramForecast, forecastSent, configIncludesCaba, forecastHistory, reportHost);
 
+        tryCatchUpMeasuresSummariesOnStartup(
+                measuresDir, measuresSummarySentPath, stations, config, mail, telegramMeasuresSummary, reportHost);
+
         while (true) {
+            trySendMeasuresSummaries(
+                    measuresDir, measuresSummarySentPath, stations, config, mail, telegramMeasuresSummary, reportHost);
             ZonedDateTime nowHourArt = ZonedDateTime.now(BUENOS_AIRES).truncatedTo(ChronoUnit.HOURS);
             for (int i = 0; i < stations.size(); i++) {
                 SmnClient.Station station = stations.get(i);
@@ -665,6 +690,269 @@ public final class WeatherMailApplication {
             return Path.of(raw.trim());
         }
         return Path.of(DEFAULT_MEASURES_DIR);
+    }
+
+    private static Path measuresSummarySentPathFromEnv() {
+        String raw = System.getenv("SMN_MEASURES_SUMMARY_SENT_FILE");
+        if (raw != null && !raw.isBlank()) {
+            return Path.of(raw.trim());
+        }
+        return Path.of(DEFAULT_MEASURES_SUMMARY_SENT);
+    }
+
+    private static boolean measuresSummaryScheduledPollWindow(LocalTime lt) {
+        return lt.getHour() == 8 && lt.getMinute() <= 29;
+    }
+
+    /**
+     * After 08:00 ART on startup: send daily / weekly / monthly summaries if their dedupe key for today is not yet in
+     * {@code smn-measures-summary-sent.txt} (same keys as the main loop). Before 08:00 ART, skips — the scheduled
+     * window will run later.
+     */
+    private static void tryCatchUpMeasuresSummariesOnStartup(
+            Path measuresDir,
+            Path summarySentPath,
+            List<SmnClient.Station> stations,
+            Config config,
+            MailSender mail,
+            TelegramNotifier telegramMeasuresSummary,
+            String reportHost) {
+        ZonedDateTime nowArt = ZonedDateTime.now(BUENOS_AIRES);
+        LocalTime t = nowArt.toLocalTime();
+        if (t.isBefore(LocalTime.of(8, 0))) {
+            LOG.info(
+                    "Measures summary catch-up at startup: before 08:00 ART — skipping; scheduled send in 08:00–08:29 window.");
+            return;
+        }
+        try {
+            MeasuresSummarySentLog sent = MeasuresSummarySentLog.open(summarySentPath);
+            runMeasuresSummariesForToday(
+                    measuresDir, sent, stations, config, mail, telegramMeasuresSummary, reportHost, "startup catch-up");
+        } catch (IOException e) {
+            LOG.log(Level.WARNING, "Measures summary sent log unreadable at startup: " + summarySentPath, e);
+        }
+    }
+
+    /**
+     * Email + Telegram (conditions bot) summaries from {@link MeasuresDailyLog} files: previous day (daily 08:00
+     * ART), previous calendar week Mon–Sun (Mondays 08:00), previous month min/max (1st of month 08:00).
+     */
+    private static void trySendMeasuresSummaries(
+            Path measuresDir,
+            Path summarySentPath,
+            List<SmnClient.Station> stations,
+            Config config,
+            MailSender mail,
+            TelegramNotifier telegramMeasuresSummary,
+            String reportHost) {
+        ZonedDateTime nowArt = ZonedDateTime.now(BUENOS_AIRES);
+        LocalTime lt = nowArt.toLocalTime();
+        if (!measuresSummaryScheduledPollWindow(lt)) {
+            return;
+        }
+        try {
+            MeasuresSummarySentLog sent = MeasuresSummarySentLog.open(summarySentPath);
+            runMeasuresSummariesForToday(
+                    measuresDir, sent, stations, config, mail, telegramMeasuresSummary, reportHost, "scheduled");
+        } catch (IOException e) {
+            LOG.log(Level.WARNING, "Measures summary sent log unreadable: " + summarySentPath, e);
+        }
+    }
+
+    /**
+     * Sends any due summary for {@code today} (ART) if the corresponding {@code DAILY|}/{@code WEEKLY|}/{@code MONTHLY|}
+     * key is not in {@code sent}. Caller ensures time policy (startup vs poll window). Records keys only after
+     * successful email.
+     */
+    private static void runMeasuresSummariesForToday(
+            Path measuresDir,
+            MeasuresSummarySentLog sent,
+            List<SmnClient.Station> stations,
+            Config config,
+            MailSender mail,
+            TelegramNotifier telegramMeasuresSummary,
+            String reportHost,
+            String logMode) {
+        LocalDate today = ZonedDateTime.now(BUENOS_AIRES).toLocalDate();
+        String dailyKey = "DAILY|" + today;
+        if (!sent.contains(dailyKey)) {
+            LocalDate dataDay = today.minusDays(1);
+            String subj = MeasuresSummaryMessages.dailySubject(dataDay);
+            List<String> sections = new ArrayList<>();
+            StringBuilder tg = new StringBuilder();
+            tg.append(MeasuresSummaryMessages.telegramTitleBold(subj));
+            for (SmnClient.Station st : stations) {
+                try {
+                    List<MeasuresHistoryReader.MeasureRow> rows =
+                            MeasuresHistoryReader.readDay(measuresDir, dataDay, st.locationId());
+                    Optional<MeasuresSummaryMessages.TempPeriod> agg = MeasuresSummaryMessages.aggregateTemps(rows);
+                    if (agg.isPresent()) {
+                        sections.add(MeasuresSummaryMessages.formatSectionDaily(st.label(), dataDay, agg.get()));
+                        tg.append(MeasuresSummaryMessages.telegramSectionDaily(st.label(), dataDay, agg.get()));
+                    } else {
+                        sections.add(
+                                MeasuresSummaryMessages.sectionNoDataHtml(st.label(), dataDay.toString()));
+                        tg.append(MeasuresSummaryMessages.telegramSectionNoData(st.label(), dataDay.toString()));
+                    }
+                } catch (IOException e) {
+                    LOG.log(Level.FINE, "Measures read failed for daily summary " + st, e);
+                    sections.add(MeasuresSummaryMessages.sectionNoDataHtml(st.label(), dataDay.toString()));
+                    tg.append(MeasuresSummaryMessages.telegramSectionNoData(st.label(), dataDay.toString()));
+                }
+            }
+            tg.append(MeasuresSummaryMessages.telegramHostFooter(reportHost));
+            String html = MeasuresSummaryMessages.wrapEmail(subj, sections, reportHost);
+            if (sendMeasuresSummaryMailTelegram(
+                    config, mail, telegramMeasuresSummary, subj, html, tg.toString(), reportHost)) {
+                try {
+                    sent.record(dailyKey);
+                    logMeasuresSummaryKeyRecorded(logMode, dailyKey);
+                } catch (IOException e) {
+                    LOG.log(Level.WARNING, "Failed to record daily measures summary key", e);
+                }
+            }
+        }
+        if (today.getDayOfWeek() == DayOfWeek.MONDAY) {
+            String weeklyKey = "WEEKLY|" + today;
+            if (!sent.contains(weeklyKey)) {
+                LocalDate weekEnd = today.minusDays(1);
+                LocalDate weekStart = weekEnd.minusDays(6);
+                String subj = MeasuresSummaryMessages.weeklySubject(weekStart, weekEnd);
+                List<String> sections = new ArrayList<>();
+                StringBuilder tg = new StringBuilder();
+                tg.append(MeasuresSummaryMessages.telegramTitleBold(subj));
+                for (SmnClient.Station st : stations) {
+                    try {
+                        List<MeasuresHistoryReader.MeasureRow> rows =
+                                MeasuresHistoryReader.readInclusive(measuresDir, weekStart, weekEnd, st.locationId());
+                        Optional<MeasuresSummaryMessages.TempPeriod> agg = MeasuresSummaryMessages.aggregateTemps(rows);
+                        if (agg.isPresent()) {
+                            int rainDays = MeasuresHistoryReader.countRainDays(rows);
+                            MeasuresHistoryReader.WindMax windMax =
+                                    MeasuresHistoryReader.maxWindWithDirection(rows).orElse(null);
+                            sections.add(
+                                    MeasuresSummaryMessages.formatSectionWeekly(
+                                            st.label(), weekStart, weekEnd, agg.get(), rainDays, windMax));
+                            tg.append(
+                                    MeasuresSummaryMessages.telegramSectionWeekly(
+                                            st.label(), weekStart, weekEnd, agg.get(), rainDays, windMax));
+                        } else {
+                            sections.add(
+                                    MeasuresSummaryMessages.sectionNoDataHtml(
+                                            st.label(), weekStart + " – " + weekEnd));
+                            tg.append(
+                                    MeasuresSummaryMessages.telegramSectionNoData(
+                                            st.label(), weekStart + " – " + weekEnd));
+                        }
+                    } catch (IOException e) {
+                        LOG.log(Level.FINE, "Measures read failed for weekly summary " + st, e);
+                        sections.add(
+                                MeasuresSummaryMessages.sectionNoDataHtml(
+                                        st.label(), weekStart + " – " + weekEnd));
+                        tg.append(
+                                MeasuresSummaryMessages.telegramSectionNoData(
+                                        st.label(), weekStart + " – " + weekEnd));
+                    }
+                }
+                tg.append(MeasuresSummaryMessages.telegramHostFooter(reportHost));
+                String html = MeasuresSummaryMessages.wrapEmail(subj, sections, reportHost);
+                if (sendMeasuresSummaryMailTelegram(
+                        config, mail, telegramMeasuresSummary, subj, html, tg.toString(), reportHost)) {
+                    try {
+                        sent.record(weeklyKey);
+                        logMeasuresSummaryKeyRecorded(logMode, weeklyKey);
+                    } catch (IOException e) {
+                        LOG.log(Level.WARNING, "Failed to record weekly measures summary key", e);
+                    }
+                }
+            }
+        }
+        if (today.getDayOfMonth() == 1) {
+            String monthlyKey = "MONTHLY|" + today;
+            if (!sent.contains(monthlyKey)) {
+                YearMonth prevYm = YearMonth.from(today).minusMonths(1);
+                LocalDate mStart = prevYm.atDay(1);
+                LocalDate mEnd = prevYm.atEndOfMonth();
+                int y = prevYm.getYear();
+                int mv = prevYm.getMonthValue();
+                String subj = MeasuresSummaryMessages.monthlySubject(y, mv);
+                List<String> sections = new ArrayList<>();
+                StringBuilder tg = new StringBuilder();
+                tg.append(MeasuresSummaryMessages.telegramTitleBold(subj));
+                for (SmnClient.Station st : stations) {
+                    try {
+                        List<MeasuresHistoryReader.MeasureRow> rows =
+                                MeasuresHistoryReader.readInclusive(measuresDir, mStart, mEnd, st.locationId());
+                        Optional<Double> minM = MeasuresSummaryMessages.monthMinTemp(rows);
+                        Optional<Double> maxM = MeasuresSummaryMessages.monthMaxTemp(rows);
+                        if (minM.isPresent() && maxM.isPresent()) {
+                            sections.add(
+                                    MeasuresSummaryMessages.formatSectionMonthly(
+                                            st.label(), y, mv, minM.get(), maxM.get()));
+                            tg.append(
+                                    MeasuresSummaryMessages.telegramSectionMonthly(
+                                            st.label(), y, mv, minM.get(), maxM.get()));
+                        } else {
+                            sections.add(
+                                    MeasuresSummaryMessages.sectionNoDataHtml(
+                                            st.label(), mv + "/" + y));
+                            tg.append(MeasuresSummaryMessages.telegramSectionNoData(st.label(), mv + "/" + y));
+                        }
+                    } catch (IOException e) {
+                        LOG.log(Level.FINE, "Measures read failed for monthly summary " + st, e);
+                        sections.add(MeasuresSummaryMessages.sectionNoDataHtml(st.label(), mv + "/" + y));
+                        tg.append(MeasuresSummaryMessages.telegramSectionNoData(st.label(), mv + "/" + y));
+                    }
+                }
+                tg.append(MeasuresSummaryMessages.telegramHostFooter(reportHost));
+                String html = MeasuresSummaryMessages.wrapEmail(subj, sections, reportHost);
+                if (sendMeasuresSummaryMailTelegram(
+                        config, mail, telegramMeasuresSummary, subj, html, tg.toString(), reportHost)) {
+                    try {
+                        sent.record(monthlyKey);
+                        logMeasuresSummaryKeyRecorded(logMode, monthlyKey);
+                    } catch (IOException e) {
+                        LOG.log(Level.WARNING, "Failed to record monthly measures summary key", e);
+                    }
+                }
+            }
+        }
+    }
+
+    private static void logMeasuresSummaryKeyRecorded(String logMode, String key) {
+        if (!"startup catch-up".equals(logMode)) {
+            return;
+        }
+        LOG.info(() -> "Measures summary catch-up at startup: recorded " + key);
+    }
+
+    private static boolean sendMeasuresSummaryMailTelegram(
+            Config config,
+            MailSender mail,
+            TelegramNotifier telegramMeasuresSummary,
+            String subject,
+            String htmlEmail,
+            String telegramHtml,
+            String reportHost) {
+        String plain =
+                MeasuresSummaryMessages.telegramContentAsPlain(telegramHtml == null ? "" : telegramHtml.trim());
+        String h = reportHost != null && !reportHost.isBlank() ? reportHost.trim() : "unknown";
+        String plainEmail = plain.isEmpty() ? "(" + h + ")" : plain;
+        try {
+            mail.sendHtmlWithPlain(config.recipients(), subject, plainEmail, htmlEmail);
+            LOG.info(() -> "Measures summary email sent (HTML + plain): " + subject);
+        } catch (Exception e) {
+            LOG.log(Level.WARNING, "Measures summary email failed: " + subject, e);
+            return false;
+        }
+        if (telegramMeasuresSummary != null && telegramHtml != null && !telegramHtml.isBlank()) {
+            try {
+                telegramMeasuresSummary.sendHtml(telegramHtml.trim());
+            } catch (Exception e) {
+                LOG.log(Level.WARNING, "Measures summary Telegram failed: " + subject, e);
+            }
+        }
+        return true;
     }
 
     /**
