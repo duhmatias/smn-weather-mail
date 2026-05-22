@@ -9,13 +9,16 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.time.LocalDate;
+import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Optional;
 
 /**
@@ -24,6 +27,7 @@ import java.util.Optional;
  */
 final class ForecastDaySnapshotLog {
 
+    private static final ZoneId ART = ZoneId.of("America/Argentina/Buenos_Aires");
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final DateTimeFormatter ISO_TS = DateTimeFormatter.ISO_OFFSET_DATE_TIME;
     private static final String[] PERIOD_KEYS =
@@ -100,6 +104,64 @@ final class ForecastDaySnapshotLog {
         }
         matches.sort(Comparator.comparing(SnapshotRow::writtenArt));
         return Collections.unmodifiableList(matches);
+    }
+
+    /**
+     * For validating an observed calendar day {@code dataDay}: one snapshot per <i>prior</i> ART calendar day on which
+     * this app logged at least one bulletin that still included {@code dataDay} in SMN {@code forecast[]}. Within each
+     * such day, the row with the latest {@link SnapshotRow#writtenArt} is kept (last forecast of that day). Days are
+     * ordered from most recent prior day first (e.g. {@code dataDay}{@code -1}, then {@code -2}, …).
+     */
+    /**
+     * Latest {@link SnapshotRow#writtenArt} among all lines in the log (when SMN forecast JSON was stored with a day row).
+     */
+    Optional<ZonedDateTime> latestSnapshotWrittenArt() throws IOException {
+        if (!Files.isRegularFile(file)) {
+            return Optional.empty();
+        }
+        ZonedDateTime best = null;
+        for (String line : Files.readAllLines(file, StandardCharsets.UTF_8)) {
+            Optional<SnapshotRow> row = parseLine(line);
+            if (row.isEmpty()) {
+                continue;
+            }
+            ZonedDateTime w = row.get().writtenArt();
+            if (best == null || w.isAfter(best)) {
+                best = w;
+            }
+        }
+        return Optional.ofNullable(best);
+    }
+
+    List<SnapshotRow> findLastSnapshotPerPriorDay(LocalDate dataDay, int locationId) throws IOException {
+        if (!Files.isRegularFile(file)) {
+            return Collections.emptyList();
+        }
+        Map<LocalDate, SnapshotRow> best = new HashMap<>();
+        for (String line : Files.readAllLines(file, StandardCharsets.UTF_8)) {
+            Optional<SnapshotRow> opt = parseLine(line);
+            if (opt.isEmpty()) {
+                continue;
+            }
+            SnapshotRow r = opt.get();
+            if (r.locationId != locationId || !r.targetDay.equals(dataDay)) {
+                continue;
+            }
+            LocalDate logDay = r.writtenArt.withZoneSameInstant(ART).toLocalDate();
+            if (!logDay.isBefore(dataDay)) {
+                continue;
+            }
+            SnapshotRow prev = best.get(logDay);
+            if (prev == null || r.writtenArt.isAfter(prev.writtenArt)) {
+                best.put(logDay, r);
+            }
+        }
+        List<SnapshotRow> out = new ArrayList<>(best.values());
+        out.sort(
+                Comparator.comparing(
+                                (SnapshotRow r) -> r.writtenArt.withZoneSameInstant(ART).toLocalDate())
+                        .reversed());
+        return Collections.unmodifiableList(out);
     }
 
     private static Optional<SnapshotRow> parseLine(String line) {
@@ -233,6 +295,11 @@ final class ForecastDaySnapshotLog {
 
         String smnUpdated() {
             return smnUpdated;
+        }
+
+        /** ART calendar date when this line was appended (the “day of” the stored bulletin). */
+        LocalDate logDayArt() {
+            return writtenArt.withZoneSameInstant(ART).toLocalDate();
         }
     }
 

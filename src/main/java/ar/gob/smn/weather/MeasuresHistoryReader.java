@@ -5,7 +5,9 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.LocalDate;
+import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
@@ -21,6 +23,8 @@ import java.util.Set;
 final class MeasuresHistoryReader {
 
     private static final DateTimeFormatter DAY_FILE = DateTimeFormatter.ofPattern("uuuu-MM-dd", Locale.ROOT);
+    /** Same as {@link MeasuresDailyLog} row timestamp column. */
+    private static final DateTimeFormatter LINE_TS = DateTimeFormatter.ofPattern("uuuu-MM-dd HH:mm:ss XXX", Locale.ROOT);
 
     /** Column widths and gaps — must match {@link MeasuresDailyLog}. */
     private static final int W_TIME = 28;
@@ -100,7 +104,23 @@ final class MeasuresHistoryReader {
         String windDir = slice(line, I0_DIR, W_DIR).trim();
         Double wind = parseDoubleCol(slice(line, I0_SPD, W_SPD));
         String cond = slice(line, I0_COND, W_COND).trim();
-        return Optional.of(new MeasureRow(fileDay, loc, station, temp, feels, windDir, wind, cond));
+        Optional<ZonedDateTime> obsTime = parseObservationTime(slice(line, I0_TIME, W_TIME));
+        return Optional.of(new MeasureRow(fileDay, loc, station, temp, feels, windDir, wind, cond, obsTime));
+    }
+
+    private static Optional<ZonedDateTime> parseObservationTime(String timeCol) {
+        if (timeCol == null) {
+            return Optional.empty();
+        }
+        String t = timeCol.trim();
+        if (t.isEmpty()) {
+            return Optional.empty();
+        }
+        try {
+            return Optional.of(ZonedDateTime.parse(t, LINE_TS));
+        } catch (DateTimeParseException e) {
+            return Optional.empty();
+        }
     }
 
     private static String slice(String line, int start, int width) {
@@ -201,6 +221,8 @@ final class MeasuresHistoryReader {
         private final String windDir;
         private final Double windKmh;
         private final String conditions;
+        /** Parsed from the row’s {@code observation_time_art} column; empty when missing or unparsable. */
+        private final Optional<ZonedDateTime> observationArt;
 
         MeasureRow(
                 LocalDate day,
@@ -210,7 +232,8 @@ final class MeasuresHistoryReader {
                 Double feelsC,
                 String windDir,
                 Double windKmh,
-                String conditions) {
+                String conditions,
+                Optional<ZonedDateTime> observationArt) {
             this.day = day;
             this.locationId = locationId;
             this.stationLabel = stationLabel;
@@ -219,6 +242,7 @@ final class MeasuresHistoryReader {
             this.windDir = windDir;
             this.windKmh = windKmh;
             this.conditions = conditions;
+            this.observationArt = observationArt != null ? observationArt : Optional.empty();
         }
 
         LocalDate day() {
@@ -252,6 +276,11 @@ final class MeasuresHistoryReader {
 
         String conditions() {
             return conditions;
+        }
+
+        /** When present, wall-clock instant for this row (Buenos Aires zone in the log file). */
+        Optional<ZonedDateTime> observationArt() {
+            return observationArt;
         }
     }
 }

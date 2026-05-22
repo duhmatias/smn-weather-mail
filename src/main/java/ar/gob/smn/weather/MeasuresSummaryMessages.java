@@ -1,6 +1,8 @@
 package ar.gob.smn.weather;
 
 import java.time.LocalDate;
+import java.time.ZoneId;
+import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.List;
 import java.util.Locale;
@@ -10,13 +12,18 @@ import java.util.Optional;
 final class MeasuresSummaryMessages {
 
     private static final Locale ES_AR = Locale.forLanguageTag("es-AR");
+    private static final ZoneId ART = ZoneId.of("America/Argentina/Buenos_Aires");
     private static final DateTimeFormatter DAY = DateTimeFormatter.ofPattern("d MMM uuuu", ES_AR);
+    private static final DateTimeFormatter CLOCK = DateTimeFormatter.ofPattern("HH:mm", ES_AR);
+    private static final DateTimeFormatter CLOCK_DAY = DateTimeFormatter.ofPattern("d MMM HH:mm", ES_AR);
 
     private MeasuresSummaryMessages() {}
 
     static Optional<TempPeriod> aggregateTemps(List<MeasuresHistoryReader.MeasureRow> rows) {
         double minT = Double.POSITIVE_INFINITY;
         double maxT = Double.NEGATIVE_INFINITY;
+        Optional<ZonedDateTime> minAt = Optional.empty();
+        Optional<ZonedDateTime> maxAt = Optional.empty();
         double sumT = 0;
         int nT = 0;
         double minF = Double.POSITIVE_INFINITY;
@@ -26,8 +33,23 @@ final class MeasuresSummaryMessages {
         for (MeasuresHistoryReader.MeasureRow r : rows) {
             if (r.tempC() != null && !Double.isNaN(r.tempC())) {
                 double t = r.tempC();
-                minT = Math.min(minT, t);
-                maxT = Math.max(maxT, t);
+                Optional<ZonedDateTime> obs = r.observationArt().map(z -> z.withZoneSameInstant(ART));
+                if (t < minT) {
+                    minT = t;
+                    minAt = obs;
+                } else if (Double.compare(t, minT) == 0 && obs.isPresent()) {
+                    if (minAt.isEmpty() || obs.get().isBefore(minAt.get())) {
+                        minAt = obs;
+                    }
+                }
+                if (t > maxT) {
+                    maxT = t;
+                    maxAt = obs;
+                } else if (Double.compare(t, maxT) == 0 && obs.isPresent()) {
+                    if (maxAt.isEmpty() || obs.get().isAfter(maxAt.get())) {
+                        maxAt = obs;
+                    }
+                }
                 sumT += t;
                 nT++;
             }
@@ -46,35 +68,17 @@ final class MeasuresSummaryMessages {
         Double maxFeel = nF > 0 ? maxF : null;
         Double avgFeel = nF > 0 ? sumF / nF : null;
         return Optional.of(
-                new TempPeriod(minT, maxT, sumT / nT, nT, minFeel, maxFeel, avgFeel, nF));
-    }
-
-    static Optional<Double> monthMinTemp(List<MeasuresHistoryReader.MeasureRow> rows) {
-        Double min = null;
-        for (MeasuresHistoryReader.MeasureRow r : rows) {
-            if (r.tempC() == null || Double.isNaN(r.tempC())) {
-                continue;
-            }
-            double t = r.tempC();
-            if (min == null || t < min) {
-                min = t;
-            }
-        }
-        return Optional.ofNullable(min);
-    }
-
-    static Optional<Double> monthMaxTemp(List<MeasuresHistoryReader.MeasureRow> rows) {
-        Double max = null;
-        for (MeasuresHistoryReader.MeasureRow r : rows) {
-            if (r.tempC() == null || Double.isNaN(r.tempC())) {
-                continue;
-            }
-            double t = r.tempC();
-            if (max == null || t > max) {
-                max = t;
-            }
-        }
-        return Optional.ofNullable(max);
+                new TempPeriod(
+                        minT,
+                        maxT,
+                        sumT / nT,
+                        nT,
+                        minFeel,
+                        maxFeel,
+                        avgFeel,
+                        nF,
+                        minAt,
+                        maxAt));
     }
 
     static final class TempPeriod {
@@ -86,6 +90,10 @@ final class MeasuresSummaryMessages {
         private final Double maxFeel;
         private final Double avgFeel;
         private final int feelSamples;
+        /** ART instant of a row achieving {@link #minTemp()} (earliest among ties). */
+        private final Optional<ZonedDateTime> minTempAt;
+        /** ART instant of a row achieving {@link #maxTemp()} (latest among ties). */
+        private final Optional<ZonedDateTime> maxTempAt;
 
         TempPeriod(
                 double minTemp,
@@ -95,7 +103,9 @@ final class MeasuresSummaryMessages {
                 Double minFeel,
                 Double maxFeel,
                 Double avgFeel,
-                int feelSamples) {
+                int feelSamples,
+                Optional<ZonedDateTime> minTempAt,
+                Optional<ZonedDateTime> maxTempAt) {
             this.minTemp = minTemp;
             this.maxTemp = maxTemp;
             this.avgTemp = avgTemp;
@@ -104,6 +114,8 @@ final class MeasuresSummaryMessages {
             this.maxFeel = maxFeel;
             this.avgFeel = avgFeel;
             this.feelSamples = feelSamples;
+            this.minTempAt = minTempAt != null ? minTempAt : Optional.empty();
+            this.maxTempAt = maxTempAt != null ? maxTempAt : Optional.empty();
         }
 
         double minTemp() {
@@ -137,6 +149,14 @@ final class MeasuresSummaryMessages {
         int feelSamples() {
             return feelSamples;
         }
+
+        Optional<ZonedDateTime> minTempAt() {
+            return minTempAt;
+        }
+
+        Optional<ZonedDateTime> maxTempAt() {
+            return maxTempAt;
+        }
     }
 
     static String dailySubject(LocalDate dataDay) {
@@ -155,8 +175,22 @@ final class MeasuresSummaryMessages {
         StringBuilder sb = new StringBuilder();
         sb.append("<p><b>").append(esc(stationName)).append("</b> — ").append(esc(dataDay.format(DAY))).append("</p>");
         sb.append("<ul>");
-        sb.append("<li>Mínima: <b>").append(fmt1(p.minTemp())).append("</b> °C</li>");
-        sb.append("<li>Máxima: <b>").append(fmt1(p.maxTemp())).append("</b> °C</li>");
+        sb.append("<li>Mínima: <b>").append(fmt1(p.minTemp())).append("</b> °C");
+        p.minTempAt()
+                .ifPresent(
+                        z ->
+                                sb.append(" (hora ART: <b>")
+                                        .append(z.withZoneSameInstant(ART).format(CLOCK))
+                                        .append("</b>)"));
+        sb.append("</li>");
+        sb.append("<li>Máxima: <b>").append(fmt1(p.maxTemp())).append("</b> °C");
+        p.maxTempAt()
+                .ifPresent(
+                        z ->
+                                sb.append(" (hora ART: <b>")
+                                        .append(z.withZoneSameInstant(ART).format(CLOCK))
+                                        .append("</b>)"));
+        sb.append("</li>");
         sb.append("<li>Promedio (todas las mediciones del día): <b>").append(fmt1(p.avgTemp())).append("</b> °C</li>");
         if (p.feelSamples() > 0 && p.minFeel() != null && p.maxFeel() != null && p.avgFeel() != null) {
             sb.append("<li>Sensación térmica — mín: <b>")
@@ -187,8 +221,22 @@ final class MeasuresSummaryMessages {
                 .append(esc(weekEnd.format(DAY)))
                 .append("</p>");
         sb.append("<ul>");
-        sb.append("<li>Mínima: <b>").append(fmt1(p.minTemp())).append("</b> °C</li>");
-        sb.append("<li>Máxima: <b>").append(fmt1(p.maxTemp())).append("</b> °C</li>");
+        sb.append("<li>Mínima: <b>").append(fmt1(p.minTemp())).append("</b> °C");
+        p.minTempAt()
+                .ifPresent(
+                        z ->
+                                sb.append(" (hora ART: <b>")
+                                        .append(z.withZoneSameInstant(ART).format(CLOCK_DAY))
+                                        .append("</b>)"));
+        sb.append("</li>");
+        sb.append("<li>Máxima: <b>").append(fmt1(p.maxTemp())).append("</b> °C");
+        p.maxTempAt()
+                .ifPresent(
+                        z ->
+                                sb.append(" (hora ART: <b>")
+                                        .append(z.withZoneSameInstant(ART).format(CLOCK_DAY))
+                                        .append("</b>)"));
+        sb.append("</li>");
         sb.append("<li>Promedio (todas las mediciones de la semana): <b>")
                 .append(fmt1(p.avgTemp()))
                 .append("</b> °C</li>");
@@ -221,12 +269,51 @@ final class MeasuresSummaryMessages {
         return "<p><b>" + esc(stationLabel) + "</b>: sin mediciones en el historial para " + esc(periodHuman) + ".</p>";
     }
 
-    static String formatSectionMonthly(String stationName, int year, int month, double minT, double maxT) {
+    static String formatSectionMonthly(
+            String stationName,
+            int year,
+            int month,
+            TempPeriod p,
+            int rainDays,
+            MeasuresHistoryReader.WindMax windMaxOrNull) {
         StringBuilder sb = new StringBuilder();
         sb.append("<p><b>").append(esc(stationName)).append("</b> — ").append(month).append("/").append(year).append("</p>");
         sb.append("<ul>");
-        sb.append("<li>Mínima del mes: <b>").append(fmt1(minT)).append("</b> °C</li>");
-        sb.append("<li>Máxima del mes: <b>").append(fmt1(maxT)).append("</b> °C</li>");
+        sb.append("<li>Mínima del mes: <b>").append(fmt1(p.minTemp())).append("</b> °C");
+        p.minTempAt()
+                .ifPresent(
+                        z ->
+                                sb.append(" (hora ART: <b>")
+                                        .append(z.withZoneSameInstant(ART).format(CLOCK_DAY))
+                                        .append("</b>)"));
+        sb.append("</li>");
+        sb.append("<li>Máxima del mes: <b>").append(fmt1(p.maxTemp())).append("</b> °C");
+        p.maxTempAt()
+                .ifPresent(
+                        z ->
+                                sb.append(" (hora ART: <b>")
+                                        .append(z.withZoneSameInstant(ART).format(CLOCK_DAY))
+                                        .append("</b>)"));
+        sb.append("</li>");
+        if (p.feelSamples() > 0 && p.minFeel() != null && p.maxFeel() != null) {
+            sb.append("<li>Sensación térmica — mín: <b>")
+                    .append(fmt1(p.minFeel()))
+                    .append("</b> °C, máx: <b>")
+                    .append(fmt1(p.maxFeel()))
+                    .append("</b> °C</li>");
+        }
+        sb.append("<li>Días con precipitación (según texto de condición): <b>").append(rainDays).append("</b></li>");
+        if (windMaxOrNull != null) {
+            sb.append("<li>Viento máximo del mes: <b>")
+                    .append(fmt1(windMaxOrNull.kmh()))
+                    .append("</b> km/h");
+            if (windMaxOrNull.direction() != null && !windMaxOrNull.direction().isEmpty()) {
+                sb.append(", dirección <b>").append(esc(windMaxOrNull.direction())).append("</b>");
+            }
+            sb.append("</li>");
+        } else {
+            sb.append("<li>Viento máximo del mes: —</li>");
+        }
         sb.append("</ul>");
         return sb.toString();
     }
@@ -263,8 +350,22 @@ final class MeasuresSummaryMessages {
         String nl = "\n";
         StringBuilder sb = new StringBuilder();
         sb.append("<b>").append(esc(stationName)).append("</b> — ").append(esc(dataDay.format(DAY))).append(nl);
-        sb.append("• Mínima: <b>").append(fmt1(p.minTemp())).append("</b> °C").append(nl);
-        sb.append("• Máxima: <b>").append(fmt1(p.maxTemp())).append("</b> °C").append(nl);
+        sb.append("• Mínima: <b>").append(fmt1(p.minTemp())).append("</b> °C");
+        p.minTempAt()
+                .ifPresent(
+                        z ->
+                                sb.append(" — hora ART: <b>")
+                                        .append(z.withZoneSameInstant(ART).format(CLOCK))
+                                        .append("</b>"));
+        sb.append(nl);
+        sb.append("• Máxima: <b>").append(fmt1(p.maxTemp())).append("</b> °C");
+        p.maxTempAt()
+                .ifPresent(
+                        z ->
+                                sb.append(" — hora ART: <b>")
+                                        .append(z.withZoneSameInstant(ART).format(CLOCK))
+                                        .append("</b>"));
+        sb.append(nl);
         sb.append("• Promedio (todas las mediciones del día): <b>")
                 .append(fmt1(p.avgTemp()))
                 .append("</b> °C")
@@ -300,8 +401,22 @@ final class MeasuresSummaryMessages {
                 .append(" – ")
                 .append(esc(weekEnd.format(DAY)))
                 .append(nl);
-        sb.append("• Mínima: <b>").append(fmt1(p.minTemp())).append("</b> °C").append(nl);
-        sb.append("• Máxima: <b>").append(fmt1(p.maxTemp())).append("</b> °C").append(nl);
+        sb.append("• Mínima: <b>").append(fmt1(p.minTemp())).append("</b> °C");
+        p.minTempAt()
+                .ifPresent(
+                        z ->
+                                sb.append(" — hora ART: <b>")
+                                        .append(z.withZoneSameInstant(ART).format(CLOCK_DAY))
+                                        .append("</b>"));
+        sb.append(nl);
+        sb.append("• Máxima: <b>").append(fmt1(p.maxTemp())).append("</b> °C");
+        p.maxTempAt()
+                .ifPresent(
+                        z ->
+                                sb.append(" — hora ART: <b>")
+                                        .append(z.withZoneSameInstant(ART).format(CLOCK_DAY))
+                                        .append("</b>"));
+        sb.append(nl);
         sb.append("• Promedio (todas las mediciones de la semana): <b>")
                 .append(fmt1(p.avgTemp()))
                 .append("</b> °C")
@@ -333,12 +448,52 @@ final class MeasuresSummaryMessages {
     }
 
     /** Mirrors {@link #formatSectionMonthly}. */
-    static String telegramSectionMonthly(String stationName, int year, int month, double minT, double maxT) {
+    static String telegramSectionMonthly(
+            String stationName,
+            int year,
+            int month,
+            TempPeriod p,
+            int rainDays,
+            MeasuresHistoryReader.WindMax windMaxOrNull) {
         String nl = "\n";
         StringBuilder sb = new StringBuilder();
         sb.append("<b>").append(esc(stationName)).append("</b> — ").append(month).append("/").append(year).append(nl);
-        sb.append("• Mínima del mes: <b>").append(fmt1(minT)).append("</b> °C").append(nl);
-        sb.append("• Máxima del mes: <b>").append(fmt1(maxT)).append("</b> °C").append(nl);
+        sb.append("• Mínima del mes: <b>").append(fmt1(p.minTemp())).append("</b> °C");
+        p.minTempAt()
+                .ifPresent(
+                        z ->
+                                sb.append(" — hora ART: <b>")
+                                        .append(z.withZoneSameInstant(ART).format(CLOCK_DAY))
+                                        .append("</b>"));
+        sb.append(nl);
+        sb.append("• Máxima del mes: <b>").append(fmt1(p.maxTemp())).append("</b> °C");
+        p.maxTempAt()
+                .ifPresent(
+                        z ->
+                                sb.append(" — hora ART: <b>")
+                                        .append(z.withZoneSameInstant(ART).format(CLOCK_DAY))
+                                        .append("</b>"));
+        sb.append(nl);
+        if (p.feelSamples() > 0 && p.minFeel() != null && p.maxFeel() != null) {
+            sb.append("• Sensación térmica — mín: <b>")
+                    .append(fmt1(p.minFeel()))
+                    .append("</b> °C, máx: <b>")
+                    .append(fmt1(p.maxFeel()))
+                    .append("</b> °C")
+                    .append(nl);
+        }
+        sb.append("• Días con precipitación (según texto de condición): <b>").append(rainDays).append("</b>").append(nl);
+        if (windMaxOrNull != null) {
+            sb.append("• Viento máximo del mes: <b>")
+                    .append(fmt1(windMaxOrNull.kmh()))
+                    .append("</b> km/h");
+            if (windMaxOrNull.direction() != null && !windMaxOrNull.direction().isEmpty()) {
+                sb.append(", dirección <b>").append(esc(windMaxOrNull.direction())).append("</b>");
+            }
+            sb.append(nl);
+        } else {
+            sb.append("• Viento máximo del mes: —").append(nl);
+        }
         sb.append(nl);
         return sb.toString();
     }

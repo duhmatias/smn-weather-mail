@@ -15,6 +15,7 @@ import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
@@ -45,6 +46,10 @@ public final class WeatherMailApplication {
     private static final Duration SLEEP_BETWEEN_STATIONS = Duration.ofSeconds(10);
     private static final DateTimeFormatter SUBJECT_TIME =
             DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm", Locale.ROOT);
+    /** Startup Telegram timestamps (Buenos Aires civil time). */
+    private static final DateTimeFormatter STARTUP_ART_DISPLAY =
+            DateTimeFormatter.ofPattern("dd-MM-yy HH:mm 'ART'", Locale.ROOT);
+    private static final DateTimeFormatter STARTUP_ART_DAY = DateTimeFormatter.ofPattern("dd-MM-yy", Locale.ROOT);
 
     private static final String DEFAULT_SENT_LOG = "smn-weather-sent.txt";
     private static final String DEFAULT_FORECAST_SENT_FILE = "smn-forecast-sent.txt";
@@ -52,6 +57,9 @@ public final class WeatherMailApplication {
     private static final String DEFAULT_FORECAST_HISTORY_DIR = "smn-forecast-history";
     private static final String DEFAULT_MEASURES_SUMMARY_SENT = "smn-measures-summary-sent.txt";
     private static final String DEFAULT_FORECAST_VALIDATION_SENT = "smn-forecast-validation-sent.txt";
+    private static final String DEFAULT_TIEPRE_EXTREMA_STATE_FILE = "smn-tiepre-extrema-state.txt";
+    private static final String DEFAULT_TIEPRE_EXTREMA_HISTORY_DIR = "smn-tiepre-extrema-history";
+    private static final String DEFAULT_TIEPRE_EXTREMA_DAILY_SENT = "smn-tiepre-extrema-daily-sent.txt";
     private static final String DEFAULT_HISTORICAL_ARCHIVE_SENT = "smn-historical-archive-sent.txt";
     private static final String DEFAULT_HISTORICAL_ARCHIVE_ZIP_DIR = "smn-historical-archives";
     private static final String FH_SRC_EMAIL = "OBS_EMAIL";
@@ -79,17 +87,41 @@ public final class WeatherMailApplication {
     /** Degrees Celsius; below this difference, temp and sensación térmica are treated as equal for the subject. */
     private static final double TEMP_SUBJECT_EPS = 0.05;
 
-    /** Default stations: CABA + Aeroparque (override with SMN_LOCATION_IDS). */
-    private static final Map<Integer, String> KNOWN_STATION_NAMES = Map.of(
-            4864, "Ciudad Autónoma de Buenos Aires",
-            10821, "Aeroparque Buenos Aires");
-
     public static void main(String[] args) throws Exception {
+        if (wantsTiepreExtremaCli(args)) {
+            runTiepreExtremaCli();
+            return;
+        }
+        String cliCurrent = parseCurrentCliQuery(args);
+        if (cliCurrent != null) {
+            if (cliCurrent.isEmpty()) {
+                System.err.println(
+                        "Usage (same config.properties / env as the service):"
+                                + System.lineSeparator()
+                                + "  ./run.sh current=Salta"
+                                + System.lineSeparator()
+                                + "  java -Dcurrent=Salta -jar target/smn-weather-mail-<version>.jar"
+                                + System.lineSeparator()
+                                + "  JAR=$(ls -t target/smn-weather-mail-*.jar | head -n1); java -cp \"$JAR:target/lib/*\" "
+                                + "ar.gob.smn.weather.WeatherMailApplication current=Salta"
+                                + System.lineSeparator()
+                                + "  ./run.sh extreme   (or: add extreme, tiepre-extrema — one-shot tiepre extrema Telegram/email; "
+                                + "requires tiepre.extrema.enabled)"
+                                + System.lineSeparator()
+                                + "(Do not put *.jar inside double quotes — the shell must expand the glob.)");
+                System.exit(2);
+            }
+            runCurrentCli(cliCurrent);
+            return;
+        }
+
         Config config = Config.load();
-        SmnClient smn = new SmnClient();
+        SmnClient smn = new SmnClient(config.smnWsCookieHeader());
         MailSender mail = new MailSender(config);
         TelegramNotifier telegramConditions =
-                config.telegram() != null ? new TelegramNotifier(config.telegram()) : null;
+                config.telegram() != null
+                        ? new TelegramNotifier(config.telegram(), config.telegramConditionsSubscriberChatsFile())
+                        : null;
         TelegramNotifier telegramForecastValidation =
                 config.telegramForValidation() != null
                         ? new TelegramNotifier(config.telegramForValidation())
@@ -101,7 +133,7 @@ public final class WeatherMailApplication {
                         ? new TelegramNotifier(config.telegramForMeasuresSummaries())
                         : null;
 
-        List<SmnClient.Station> stations = stationsFromEnv();
+        List<SmnClient.Station> stations = config.smnWeatherLocations();
         Path sentLogPath = sentLogPathFromEnv();
         SentWeatherLog sent = SentWeatherLog.open(sentLogPath);
         Path forecastSentPath = forecastSentPathFromEnv();
@@ -116,6 +148,11 @@ public final class WeatherMailApplication {
         ForecastDaySnapshotLog forecastDaySnapshotLog =
                 new ForecastDaySnapshotLog(forecastHistoryDir.resolve("forecast-day-snapshots.log"));
         Path forecastValidationSentPath = forecastValidationSentPathFromEnv();
+        Path tiepreExtremaStatePath = tiepreExtremaStatePathFromEnv();
+        Path tiepreExtremaHistoryDir = tiepreExtremaHistoryDirFromEnv();
+        TiepreExtremaHistoryLog tiepreExtremaHistory = new TiepreExtremaHistoryLog(tiepreExtremaHistoryDir);
+        Path tiepreExtremaDailySentPath = tiepreExtremaDailySentPathFromEnv();
+        long[] tiepreExtremaLastHourSlot = {-1L};
         Path historicalArchiveStatePath = historicalArchiveStatePathFromEnv();
         Path historicalArchiveZipDir = historicalArchiveZipDirFromEnv();
         boolean configIncludesCaba = stationListIncludesCaba(stations);
@@ -139,6 +176,21 @@ public final class WeatherMailApplication {
         LOG.info(() -> "Recipients: " + config.recipients() + " | zone: " + BUENOS_AIRES + " | poll: " + POLL_INTERVAL
                 + " (2m through :19, 5m from :20 if hourly bulletin still pending) | pause between stations: "
                 + SLEEP_BETWEEN_STATIONS);
+        if (config.tiepreExtremaEnabled()) {
+            LOG.info(
+                    () -> "Tiepre extrema (:30 ART hourly, open-data tiepre file): state "
+                            + tiepreExtremaStatePath.toAbsolutePath()
+                            + " | history dir "
+                            + tiepreExtremaHistoryDir.toAbsolutePath()
+                            + " (YYYY/MM/<day>.txt) | daily 08:00 ART dedupe "
+                            + tiepreExtremaDailySentPath.toAbsolutePath()
+                            + " | Telegram chats="
+                            + (config.telegramForTiepreExtrema() != null
+                                    ? config.telegramForTiepreExtrema().chatIds().size()
+                                    : 0)
+                            + " | email="
+                            + config.tiepreExtremaSendEmail());
+        }
         if (telegramForecastValidation != null) {
             boolean valDedicated = config.telegramValidationConfig() != null;
             LOG.info(() -> "Telegram (forecast validation): "
@@ -149,7 +201,10 @@ public final class WeatherMailApplication {
                             : " — same bot as conditions (telegram.bot.token)"));
         }
         if (telegramConditions != null) {
-            LOG.info(() -> "Telegram (conditions): " + config.telegram().chatIds().size() + " chat(s)");
+            LOG.info(() -> "Telegram (conditions): " + config.telegram().chatIds().size() + " chat(s) in config"
+                    + (config.telegramConditionsSubscriberChatsFile() != null
+                            ? " + subscriber file " + config.telegramConditionsSubscriberChatsFile()
+                            : ""));
             if (config.telegramForecastConfig() != null) {
                 boolean otherBot =
                         !config.telegramForForecast().botToken().equals(config.telegram().botToken());
@@ -168,9 +223,29 @@ public final class WeatherMailApplication {
                             ? " — telegram.summaries.bot.token / TELEGRAM_SUMMARIES_BOT_TOKEN"
                             : " — same bot as conditions (telegram.bot.token)"));
         }
+        if (config.telegramStartup() != null) {
+            Config.Telegram su = config.telegramStartup();
+            boolean otherBot =
+                    config.telegram() == null || !su.botToken().equals(config.telegram().botToken());
+            LOG.info(() -> "Telegram (startup message): "
+                    + su.chatIds().size()
+                    + " chat(s)"
+                    + (otherBot
+                            ? " — telegram.startup.bot.token / TELEGRAM_STARTUP_BOT_TOKEN"
+                            : " — same bot as conditions (telegram.bot.token)"));
+        }
 
         String reportHost = resolveReportHostLabel(config);
         LOG.info(() -> "Condition messages host footer: " + reportHost + " (smn.report.host / SMN_REPORT_HOST / HOSTNAME)");
+
+        trySendStartupTelegram(
+                config,
+                reportHost,
+                sent,
+                forecastSent,
+                forecastDaySnapshotLog,
+                forecastValidationSentPath,
+                stations);
 
         String commandsBotToken = config.telegramCommandsBotToken();
         if (commandsBotToken != null && !commandsBotToken.isBlank()) {
@@ -179,14 +254,17 @@ public final class WeatherMailApplication {
                             new TelegramBotCommandListener(
                                     commandsBotToken,
                                     reportHost,
-                                    config.telegramImageBotToken(),
-                                    config.smnTopesCentroImageUrl()),
+                                    config.telegramCurrentConditionsBotToken(),
+                                    smn,
+                                    config.smnWeatherLocations(),
+                                    config.telegramConditionsSubscriberChatsFile(),
+                                    config.telegram() != null ? config.telegram().chatIds() : List.of()),
                             "telegram-commands");
             cmdThread.setDaemon(true);
             cmdThread.start();
             LOG.info(
-                    "Telegram command listener: on (getUpdates /hello; /image → SMN topes centro si"
-                            + " telegram.image.bot.token está definido)");
+                    "Telegram command listener: on (getUpdates /hello; /subscribe|unsubscribe current [day-schedule]; /current → buscador SMN si"
+                            + " telegram.current.bot.token está definido)");
         }
 
         tryCatchUpMissingForecastTelegramOnStartup(
@@ -211,11 +289,24 @@ public final class WeatherMailApplication {
                 telegramForecastValidation,
                 reportHost);
 
+        tryCatchUpTiepreExtremaDailySummaryOnStartup(
+                config, mail, tiepreExtremaHistory, tiepreExtremaDailySentPath, reportHost);
+
         HistoricalMonthArchive.validateStateOnStartup(historicalArchiveStatePath, BUENOS_AIRES);
         tryHistoricalMonthArchive(measuresDir, forecastHistoryDir, historicalArchiveStatePath, historicalArchiveZipDir);
 
         while (true) {
             tryHistoricalMonthArchive(measuresDir, forecastHistoryDir, historicalArchiveStatePath, historicalArchiveZipDir);
+            tryTiepreExtremaHalfHourly(
+                    config,
+                    smn,
+                    mail,
+                    tiepreExtremaStatePath,
+                    tiepreExtremaHistory,
+                    reportHost,
+                    tiepreExtremaLastHourSlot);
+            tryTiepreExtremaDailySummary(
+                    config, mail, tiepreExtremaHistory, tiepreExtremaDailySentPath, reportHost);
             trySendMeasuresSummaries(
                     measuresDir, measuresSummarySentPath, stations, config, mail, telegramMeasuresSummary, reportHost);
             trySendForecastValidation(
@@ -296,7 +387,7 @@ public final class WeatherMailApplication {
                     mail.send(config.recipients(), subject, bodyEmail);
                     if (telegramConditions != null) {
                         try {
-                            telegramConditions.sendHtml(bodyTelegram);
+                            telegramConditions.sendConditionHtml(bodyTelegram, station.locationId());
                         } catch (Exception e) {
                             LOG.log(Level.WARNING, "Telegram send failed (email was sent)", e);
                         }
@@ -434,7 +525,7 @@ public final class WeatherMailApplication {
             ForecastDaySnapshotLog forecastDaySnapshotLog,
             String reportHost) {
         if (telegramForecast == null || !configIncludesCaba) {
-            LOG.info("Forecast catch-up at startup: skipped (Telegram off or CABA not in SMN_LOCATION_IDS).");
+            LOG.info("Forecast catch-up at startup: skipped (Telegram off or CABA not in smn.location.ids / SMN_LOCATION_IDS).");
             return;
         }
         ZonedDateTime art = ZonedDateTime.now(BUENOS_AIRES);
@@ -760,7 +851,7 @@ public final class WeatherMailApplication {
     }
 
     private static SmnClient.Station cabaStation() {
-        return new SmnClient.Station(CABA_LOCATION_ID, KNOWN_STATION_NAMES.get(CABA_LOCATION_ID));
+        return new SmnClient.Station(CABA_LOCATION_ID, "Ciudad Autónoma de Buenos Aires");
     }
 
     private static boolean stationListIncludesCaba(List<SmnClient.Station> stations) {
@@ -770,6 +861,391 @@ public final class WeatherMailApplication {
             }
         }
         return false;
+    }
+
+    /**
+     * Non-{@code null} when the user wants a one-shot “current conditions” run instead of the long-running service:
+     * {@code -Dcurrent=…} or program args {@code current=…} / {@code current …}.
+     */
+    private static String parseCurrentCliQuery(String[] args) {
+        String prop = System.getProperty("current");
+        if (prop != null) {
+            return prop.trim();
+        }
+        if (args.length >= 1) {
+            if (args[0].startsWith("current=")) {
+                return args[0].substring("current=".length()).trim();
+            }
+            if ("current".equalsIgnoreCase(args[0])) {
+                if (args.length < 2) {
+                    return "";
+                }
+                return String.join(" ", Arrays.copyOfRange(args, 1, args.length)).trim();
+            }
+        }
+        return null;
+    }
+
+    /**
+     * One-shot tiepre extrema send (same payload as the hourly job): {@code extreme}, {@code tiepre-extrema},
+     * {@code add extreme}, or {@code -Dextreme=true}. Dedupe vs last fingerprint is skipped so a send is always
+     * attempted; fingerprint is still updated after a successful send.
+     */
+    private static boolean wantsTiepreExtremaCli(String[] args) {
+        String prop = System.getProperty("extreme");
+        if (prop != null && !prop.isBlank()) {
+            String p = prop.trim();
+            if (p.equalsIgnoreCase("true") || "1".equals(p) || p.equalsIgnoreCase("yes")) {
+                return true;
+            }
+        }
+        if (args.length >= 1) {
+            String a0 = args[0].trim();
+            if ("extreme".equalsIgnoreCase(a0)
+                    || "extremes".equalsIgnoreCase(a0)
+                    || "tiepre-extrema".equalsIgnoreCase(a0)
+                    || "tiepre_extrema".equalsIgnoreCase(a0)) {
+                return true;
+            }
+            if (args.length >= 2
+                    && "add".equalsIgnoreCase(args[0].trim())
+                    && "extreme".equalsIgnoreCase(args[1].trim())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static void runTiepreExtremaCli() throws Exception {
+        Config config = Config.load();
+        if (!config.tiepreExtremaEnabled()) {
+            System.err.println(
+                    "Set tiepre.extrema.enabled=true (and telegram.tiepre.extrema.chat.ids / mail) in config, or "
+                            + "TIEPRE_EXTREMA_ENABLED=1.");
+            System.exit(2);
+        }
+        if (config.telegramForTiepreExtrema() == null && !config.tiepreExtremaSendEmail()) {
+            System.err.println(
+                    "Tiepre extrema CLI needs at least one outlet: configure telegram.tiepre.extrema.chat.ids or set "
+                            + "tiepre.extrema.email=true with mail.to recipients.");
+            System.exit(2);
+        }
+        LOG.info("CLI tiepre extrema: one-shot (fingerprint dedupe skipped; state file updated after successful send)");
+        SmnClient smn = new SmnClient(config.smnWsCookieHeader());
+        MailSender mail = new MailSender(config);
+        Path statePath = tiepreExtremaStatePathFromEnv();
+        TiepreExtremaHistoryLog historyLog = new TiepreExtremaHistoryLog(tiepreExtremaHistoryDirFromEnv());
+        String reportHost = resolveReportHostLabel(config);
+        TiepreExtremaDeliver d =
+                deliverTiepreExtremaOnce(config, smn, mail, statePath, historyLog, reportHost, true);
+        switch (d) {
+            case SENT:
+                System.out.println("Tiepre extrema: sent (Telegram and/or email).");
+                return;
+            case SKIPPED_UNCHANGED:
+                // Not used when ignoreDedupe=true
+                System.out.println("Tiepre extrema: skipped unchanged.");
+                return;
+            case NO_TIEPRE_BODY:
+                System.err.println("Tiepre extrema: SMN open-data tiepre file missing or empty.");
+                System.exit(1);
+                return;
+            case NO_TEMPERATURE_DATA:
+                System.err.println("Tiepre extrema: no numeric temperatures in tiepre file.");
+                System.exit(1);
+                return;
+            case IO_ERROR:
+                System.err.println("Tiepre extrema: I/O error (see logs).");
+                System.exit(1);
+                return;
+            case SEND_FAILED:
+                System.err.println("Tiepre extrema: Telegram and/or email send failed (see logs).");
+                System.exit(1);
+                return;
+            case INTERRUPTED:
+                System.err.println("Tiepre extrema: interrupted.");
+                System.exit(130);
+                break;
+            default:
+                System.err.println("Tiepre extrema: unexpected outcome " + d);
+                System.exit(1);
+        }
+    }
+
+    private enum TiepreExtremaDeliver {
+        SENT,
+        SKIPPED_UNCHANGED,
+        NO_TIEPRE_BODY,
+        NO_TEMPERATURE_DATA,
+        IO_ERROR,
+        SEND_FAILED,
+        INTERRUPTED
+    }
+
+    /**
+     * Fetches tiepre, computes extrema, optionally compares to {@code statePath} fingerprint, sends Telegram/email,
+     * writes fingerprint on full success.
+     *
+     * @param ignoreDedupe when {@code true} (CLI), skip reading state and never return {@link TiepreExtremaDeliver#SKIPPED_UNCHANGED}.
+     */
+    private static TiepreExtremaDeliver deliverTiepreExtremaOnce(
+            Config config,
+            SmnClient smn,
+            MailSender mail,
+            Path statePath,
+            TiepreExtremaHistoryLog historyLog,
+            String reportHost,
+            boolean ignoreDedupe) {
+        Optional<String> bodyOpt;
+        try {
+            bodyOpt = smn.fetchTieprePlainText();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return TiepreExtremaDeliver.INTERRUPTED;
+        } catch (IOException e) {
+            LOG.log(Level.WARNING, "Tiepre extrema: tiepre fetch failed: " + e.getMessage(), e);
+            return TiepreExtremaDeliver.IO_ERROR;
+        }
+        if (bodyOpt.isEmpty()) {
+            return TiepreExtremaDeliver.NO_TIEPRE_BODY;
+        }
+        List<SmnClient.Observation> all = TiepreOpenData.allObservations(bodyOpt.get());
+        ZonedDateTime art = ZonedDateTime.now(BUENOS_AIRES);
+        Optional<TiepreExtremaHourly.Snapshot> snapOpt =
+                TiepreExtremaHourly.compute(all, config.tiepreExtremaExcludeStations(), art.toInstant());
+        if (snapOpt.isEmpty()) {
+            return TiepreExtremaDeliver.NO_TEMPERATURE_DATA;
+        }
+        TiepreExtremaHourly.Snapshot snap = snapOpt.get();
+        String fp = TiepreExtremaHourly.fingerprint(snap);
+        if (!ignoreDedupe) {
+            Optional<String> prev;
+            try {
+                prev = TiepreExtremaState.readLastFingerprint(statePath);
+            } catch (IOException e) {
+                LOG.log(Level.WARNING, "Tiepre extrema: cannot read state file: " + e.getMessage(), e);
+                return TiepreExtremaDeliver.IO_ERROR;
+            }
+            if (prev.isPresent() && prev.get().equals(fp)) {
+                return TiepreExtremaDeliver.SKIPPED_UNCHANGED;
+            }
+        }
+
+        Config.Telegram tg = config.telegramForTiepreExtrema();
+        boolean needTg = tg != null;
+        boolean needMail = config.tiepreExtremaSendEmail();
+        boolean tgOk = !needTg;
+        if (needTg) {
+            try {
+                new TelegramNotifier(tg)
+                        .sendHtml(
+                                TiepreExtremaHourly.formatTelegramHtml(
+                                        snap,
+                                        BUENOS_AIRES,
+                                        reportHost,
+                                        config.tiepreExtremaExcludeStationsInMessage()));
+                tgOk = true;
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return TiepreExtremaDeliver.INTERRUPTED;
+            } catch (IOException e) {
+                LOG.log(Level.WARNING, "Tiepre extrema: Telegram send failed: " + e.getMessage(), e);
+                tgOk = false;
+            }
+        }
+        boolean mailOk = !needMail;
+        if (needMail) {
+            try {
+                String subj =
+                        "Datos extremos horarios — "
+                                + art.format(DateTimeFormatter.ofPattern("dd-MM-yyyy HH:mm 'ART'", Locale.ROOT));
+                mail.send(
+                        config.recipients(),
+                        subj,
+                        TiepreExtremaHourly.formatEmailHtml(
+                                snap, BUENOS_AIRES, reportHost, config.tiepreExtremaExcludeStationsInMessage()));
+                mailOk = true;
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return TiepreExtremaDeliver.INTERRUPTED;
+            } catch (Exception e) {
+                LOG.log(Level.WARNING, "Tiepre extrema: email send failed: " + e.getMessage(), e);
+                mailOk = false;
+            }
+        }
+        if (!tgOk || !mailOk) {
+            return TiepreExtremaDeliver.SEND_FAILED;
+        }
+        try {
+            TiepreExtremaState.writeFingerprint(statePath, fp);
+        } catch (IOException e) {
+            LOG.log(Level.WARNING, "Tiepre extrema: cannot write state file: " + e.getMessage(), e);
+            return TiepreExtremaDeliver.IO_ERROR;
+        }
+        if (historyLog != null) {
+            try {
+                historyLog.append(snap, art.toInstant());
+            } catch (IOException e) {
+                LOG.log(Level.WARNING, "Tiepre extrema: history append failed: " + e.getMessage(), e);
+            }
+        }
+        return TiepreExtremaDeliver.SENT;
+    }
+
+    /** Loads config, runs the same logic as Telegram {@code /current}, prints to stdout, exits (via {@code main}). */
+    private static void runCurrentCli(String query) throws IOException, InterruptedException {
+        Config config = Config.load();
+        LOG.info("CLI current: query=«" + query + "» (single run; no mail/Telegram service)");
+        SmnClient smn = new SmnClient(config.smnWsCookieHeader());
+        String reportHost = resolveReportHostLabel(config);
+        CurrentConditionsQuery.Result r =
+                CurrentConditionsQuery.run(query, smn, reportHost, config.smnWeatherLocations());
+        System.out.println(r.allText());
+        LOG.info("CLI current: finished");
+    }
+
+    private static String formatStartupZonedArt(ZonedDateTime z) {
+        return z.withZoneSameInstant(BUENOS_AIRES).format(STARTUP_ART_DISPLAY);
+    }
+
+    /** Minimal HTML escape for Telegram {@code parse_mode=HTML} dynamic segments. */
+    private static String escapeTelegramHtml(String s) {
+        if (s == null) {
+            return "";
+        }
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;");
+    }
+
+    /** Strip startup {@code <b>} tags and reverse {@link #escapeTelegramHtml} for a plain-text Telegram retry. */
+    private static String startupHtmlToPlain(String html) {
+        if (html == null) {
+            return "";
+        }
+        String s = html.replace("<b>", "").replace("</b>", "");
+        return s.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&");
+    }
+
+    /**
+     * Sends a short HTML status to {@link Config#telegramStartup()} when set (env {@code TELEGRAM_STARTUP_BOT_TOKEN}
+     * + {@code TELEGRAM_STARTUP_CHAT_IDS} or {@code telegram.startup.*} in config): version, host, last forecast log,
+     * last CABA Telegram bulletin, last mailed observations per station, and whether today’s validation key is present.
+     */
+    private static void trySendStartupTelegram(
+            Config config,
+            String reportHost,
+            SentWeatherLog sent,
+            SentForecastLog forecastSent,
+            ForecastDaySnapshotLog forecastDaySnapshotLog,
+            Path forecastValidationSentPath,
+            List<SmnClient.Station> stations) {
+        Config.Telegram t = config.telegramStartup();
+        if (t == null) {
+            LOG.info(
+                    "Startup Telegram: off — no startup routing configured. Options: (1) telegram.startup.chat.ids / "
+                            + "TELEGRAM_STARTUP_CHAT_IDS, (2) telegram.startup.use.main.chats=true / "
+                            + "TELEGRAM_STARTUP_USE_MAIN_CHATS=1 to reuse condition Telegram chats, (3) dedicated "
+                            + "telegram.startup.bot.token. Main telegram.chat.ids alone does not send startup.");
+            return;
+        }
+        LOG.info(() -> "Startup Telegram: sending one message to " + t.chatIds().size() + " chat id(s).");
+        String version = AppVersion.implementationVersion();
+        String nl = "\n";
+        StringBuilder msg = new StringBuilder();
+        msg.append("<b>App started</b>").append(nl);
+        msg.append("<b>version</b> ").append(escapeTelegramHtml(version)).append(nl);
+        msg.append("<b>host</b> ").append(escapeTelegramHtml(reportHost)).append(nl);
+
+        try {
+            Optional<ZonedDateTime> snap = forecastDaySnapshotLog.latestSnapshotWrittenArt();
+            msg.append("<b>Última descarga guardada (forecast-day-snapshots.log):</b> ")
+                    .append(escapeTelegramHtml(
+                            snap.map(WeatherMailApplication::formatStartupZonedArt).orElse("ninguna aún")))
+                    .append(nl);
+        } catch (IOException e) {
+            msg.append("<b>Última descarga guardada (forecast-day-snapshots.log):</b> error — ")
+                    .append(escapeTelegramHtml(e.getMessage()))
+                    .append(nl);
+        }
+
+        String bulletinLine = forecastSent.startupSummarySpanish();
+        String bulletinPrefix = "Último pronóstico CABA (Telegram): ";
+        if (bulletinLine.startsWith(bulletinPrefix)) {
+            msg.append("<b>Último pronóstico CABA (Telegram):</b> ")
+                    .append(escapeTelegramHtml(bulletinLine.substring(bulletinPrefix.length())))
+                    .append(nl);
+        } else {
+            msg.append(escapeTelegramHtml(bulletinLine)).append(nl);
+        }
+
+        if (stations.isEmpty()) {
+            msg.append("<b>Últimas condiciones enviadas por correo (obs. SMN):</b> ")
+                    .append(escapeTelegramHtml("sin estaciones (smn.location.ids / SMN_LOCATION_IDS)."))
+                    .append(nl);
+        } else {
+            StringBuilder cur = new StringBuilder();
+            for (SmnClient.Station s : stations) {
+                if (cur.length() > 0) {
+                    cur.append(" | ");
+                }
+                Optional<Instant> ins = sent.latestMailedObservationInstant(s.locationId());
+                if (ins.isPresent()) {
+                    String ts = formatStartupZonedArt(ins.get().atZone(BUENOS_AIRES));
+                    cur.append(s.locationId()).append(" ").append(ts);
+                } else {
+                    cur.append(s.locationId()).append(" ninguna aún");
+                }
+            }
+            msg.append("<b>Últimas condiciones enviadas por correo (obs. SMN):</b> ")
+                    .append(escapeTelegramHtml(cur.toString()))
+                    .append(nl);
+        }
+
+        LocalDate todayArt = ZonedDateTime.now(BUENOS_AIRES).toLocalDate();
+        msg.append("<b>Validación pronóstico vs observado (ART hoy ")
+                .append(escapeTelegramHtml(todayArt.format(STARTUP_ART_DAY)))
+                .append("):</b> ");
+        try {
+            MeasuresSummarySentLog v = MeasuresSummarySentLog.open(forecastValidationSentPath);
+            if (v.contains("VALIDATION|" + todayArt)) {
+                msg.append(escapeTelegramHtml("ya enviada hoy"));
+            } else {
+                msg.append(escapeTelegramHtml("aún no enviada hoy (habitual 08:00–08:29 ART)"));
+            }
+        } catch (IOException e) {
+            msg.append(escapeTelegramHtml("no se pudo leer "))
+                    .append(escapeTelegramHtml(forecastValidationSentPath.getFileName().toString()))
+                    .append(escapeTelegramHtml(": "))
+                    .append(escapeTelegramHtml(e.getMessage()));
+        }
+
+        String htmlBody = msg.toString();
+        boolean delivered = false;
+        try {
+            new TelegramNotifier(t).sendHtml(htmlBody);
+            LOG.info("Startup Telegram: message sent (telegram.startup.* / TELEGRAM_STARTUP_*).");
+            delivered = true;
+        } catch (IOException e) {
+            LOG.log(Level.WARNING, "Startup Telegram HTML send failed: " + e.getMessage(), e);
+            try {
+                new TelegramNotifier(t).sendPlainText(startupHtmlToPlain(htmlBody));
+                LOG.info("Startup Telegram: delivered as plain text after HTML failure (check bold/parse_mode).");
+                delivered = true;
+            } catch (IOException e2) {
+                LOG.log(Level.WARNING, "Startup Telegram plain-text retry also failed: " + e2.getMessage(), e2);
+            } catch (InterruptedException e2) {
+                Thread.currentThread().interrupt();
+                LOG.log(Level.WARNING, "Startup Telegram plain-text retry interrupted", e2);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            LOG.log(Level.WARNING, "Startup Telegram HTML send interrupted", e);
+        }
+        if (!delivered) {
+            LOG.severe(
+                    "Startup Telegram: startup message was not delivered ("
+                            + t.chatIds().size()
+                            + " chat id(s) configured; telegram.startup.* / TELEGRAM_STARTUP_*). See WARNING logs above.");
+        }
     }
 
     /**
@@ -856,6 +1332,232 @@ public final class WeatherMailApplication {
             return Path.of(raw.trim());
         }
         return Path.of(DEFAULT_FORECAST_VALIDATION_SENT);
+    }
+
+    private static Path tiepreExtremaStatePathFromEnv() {
+        String raw = System.getenv("SMN_TIEPRE_EXTREMA_STATE_FILE");
+        if (raw != null && !raw.isBlank()) {
+            return Path.of(raw.trim());
+        }
+        return Path.of(DEFAULT_TIEPRE_EXTREMA_STATE_FILE);
+    }
+
+    private static Path tiepreExtremaHistoryDirFromEnv() {
+        String raw = System.getenv("SMN_TIEPRE_EXTREMA_HISTORY_DIR");
+        if (raw != null && !raw.isBlank()) {
+            return Path.of(raw.trim());
+        }
+        return Path.of(DEFAULT_TIEPRE_EXTREMA_HISTORY_DIR);
+    }
+
+    private static Path tiepreExtremaDailySentPathFromEnv() {
+        String raw = System.getenv("SMN_TIEPRE_EXTREMA_DAILY_SENT_FILE");
+        if (raw != null && !raw.isBlank()) {
+            return Path.of(raw.trim());
+        }
+        return Path.of(DEFAULT_TIEPRE_EXTREMA_DAILY_SENT);
+    }
+
+    /**
+     * Once per ART clock hour from minute 30 onward: scan SMN open-data tiepre (same source as {@code /current}),
+     * compute Argentina-wide max/min temperature and strongest numeric wind, then Telegram and/or email unless the
+     * snapshot matches the last sent fingerprint.
+     */
+    private static void tryTiepreExtremaHalfHourly(
+            Config config,
+            SmnClient smn,
+            MailSender mail,
+            Path statePath,
+            TiepreExtremaHistoryLog historyLog,
+            String reportHost,
+            long[] lastHourEpochSlot) {
+        if (!config.tiepreExtremaEnabled()) {
+            return;
+        }
+        ZonedDateTime art = ZonedDateTime.now(BUENOS_AIRES);
+        if (art.getMinute() < 30) {
+            return;
+        }
+        long slot = art.toInstant().getEpochSecond() / 3600L;
+        if (slot == lastHourEpochSlot[0]) {
+            return;
+        }
+
+        TiepreExtremaDeliver d =
+                deliverTiepreExtremaOnce(config, smn, mail, statePath, historyLog, reportHost, false);
+        switch (d) {
+            case SENT:
+                LOG.info("Tiepre extrema hourly: sent (fingerprint updated)");
+                lastHourEpochSlot[0] = slot;
+                return;
+            case SKIPPED_UNCHANGED:
+                LOG.info("Tiepre extrema: snapshot unchanged vs last send — skip");
+                lastHourEpochSlot[0] = slot;
+                return;
+            case NO_TIEPRE_BODY:
+                LOG.warning("Tiepre extrema: open-data tiepre file missing or empty");
+                lastHourEpochSlot[0] = slot;
+                return;
+            case NO_TEMPERATURE_DATA:
+                LOG.info("Tiepre extrema: no numeric temperatures in tiepre file");
+                lastHourEpochSlot[0] = slot;
+                return;
+            case IO_ERROR:
+            case SEND_FAILED:
+            case INTERRUPTED:
+            default:
+                return;
+        }
+    }
+
+    /**
+     * Daily 08:00–08:29 ART tiepre extrema summary for the previous Buenos Aires calendar day. Reads
+     * {@link TiepreExtremaHistoryLog} for that day, picks the absolute max temp, min temp and max wind across all hourly
+     * records, sends Telegram (when {@link Config#telegramForTiepreExtrema()} is set) and email (when
+     * {@link Config#tiepreExtremaSendEmail()} and there are recipients), records dedupe key {@code TIEPRE_DAILY|<day>}.
+     */
+    private static void tryTiepreExtremaDailySummary(
+            Config config,
+            MailSender mail,
+            TiepreExtremaHistoryLog historyLog,
+            Path dailySentPath,
+            String reportHost) {
+        if (!config.tiepreExtremaEnabled()) {
+            return;
+        }
+        ZonedDateTime nowArt = ZonedDateTime.now(BUENOS_AIRES);
+        if (!measuresSummaryScheduledPollWindow(nowArt.toLocalTime())) {
+            return;
+        }
+        try {
+            MeasuresSummarySentLog sent = MeasuresSummarySentLog.open(dailySentPath);
+            runTiepreExtremaDailySummaryForToday(
+                    config, mail, historyLog, sent, reportHost, "scheduled");
+        } catch (IOException e) {
+            LOG.log(Level.WARNING, "Tiepre extrema daily sent log unreadable: " + dailySentPath, e);
+        }
+    }
+
+    /** After 08:00 ART on startup: send yesterday's tiepre extrema summary if not already in {@code dailySentPath}. */
+    private static void tryCatchUpTiepreExtremaDailySummaryOnStartup(
+            Config config,
+            MailSender mail,
+            TiepreExtremaHistoryLog historyLog,
+            Path dailySentPath,
+            String reportHost) {
+        if (!config.tiepreExtremaEnabled()) {
+            return;
+        }
+        ZonedDateTime nowArt = ZonedDateTime.now(BUENOS_AIRES);
+        if (nowArt.toLocalTime().isBefore(LocalTime.of(8, 0))) {
+            LOG.info(
+                    "Tiepre extrema daily catch-up at startup: before 08:00 ART — skipping; scheduled send in 08:00–08:29 window.");
+            return;
+        }
+        try {
+            MeasuresSummarySentLog sent = MeasuresSummarySentLog.open(dailySentPath);
+            runTiepreExtremaDailySummaryForToday(
+                    config, mail, historyLog, sent, reportHost, "startup catch-up");
+        } catch (IOException e) {
+            LOG.log(Level.WARNING, "Tiepre extrema daily sent log unreadable at startup: " + dailySentPath, e);
+        }
+    }
+
+    private static void runTiepreExtremaDailySummaryForToday(
+            Config config,
+            MailSender mail,
+            TiepreExtremaHistoryLog historyLog,
+            MeasuresSummarySentLog sent,
+            String reportHost,
+            String logMode) {
+        LocalDate today = ZonedDateTime.now(BUENOS_AIRES).toLocalDate();
+        String key = "TIEPRE_DAILY|" + today;
+        if (sent.contains(key)) {
+            return;
+        }
+        LocalDate dataDay = today.minusDays(1);
+        List<TiepreExtremaHistoryLog.Record> records;
+        try {
+            records = historyLog.readDay(dataDay);
+        } catch (IOException e) {
+            LOG.log(Level.WARNING, "Tiepre extrema daily summary: read failed for " + dataDay, e);
+            return;
+        }
+        if (records.isEmpty()) {
+            LOG.info(() -> "Tiepre extrema daily summary: no history rows for "
+                    + dataDay
+                    + " ("
+                    + historyLog.dayFile(dataDay).toAbsolutePath()
+                    + ") — skip without recording dedupe; will retry on next loop / restart.");
+            return;
+        }
+        TiepreExtremaHistoryLog.DailyExtremes extremes =
+                TiepreExtremaHistoryLog.pickDailyExtremes(records);
+        if (extremes.isEmpty()) {
+            LOG.info(() -> "Tiepre extrema daily summary: no parseable extremes in history for " + dataDay + " — skip.");
+            return;
+        }
+        String subject = TiepreExtremaDailyMessages.subject(dataDay);
+        String emailHtml =
+                TiepreExtremaDailyMessages.formatEmailHtml(dataDay, extremes, BUENOS_AIRES, reportHost);
+        String telegramHtml =
+                TiepreExtremaDailyMessages.formatTelegramHtml(dataDay, extremes, BUENOS_AIRES, reportHost);
+        boolean delivered = sendTiepreExtremaDailyMailTelegram(
+                config, mail, subject, emailHtml, telegramHtml, reportHost);
+        if (delivered) {
+            try {
+                sent.record(key);
+                if ("startup catch-up".equals(logMode)) {
+                    LOG.info(() -> "Tiepre extrema daily catch-up at startup: recorded " + key);
+                } else {
+                    LOG.info(() -> "Tiepre extrema daily summary sent (" + logMode + "): " + key);
+                }
+            } catch (IOException e) {
+                LOG.log(Level.WARNING, "Failed to record tiepre extrema daily key", e);
+            }
+        }
+    }
+
+    private static boolean sendTiepreExtremaDailyMailTelegram(
+            Config config,
+            MailSender mail,
+            String subject,
+            String emailHtml,
+            String telegramHtml,
+            String reportHost) {
+        boolean needTg = config.telegramForTiepreExtrema() != null;
+        boolean needMail = config.tiepreExtremaSendEmail() && !config.recipients().isEmpty();
+        if (!needTg && !needMail) {
+            LOG.fine("Tiepre extrema daily summary: no Telegram and email disabled — nothing to send.");
+            return false;
+        }
+        boolean tgOk = !needTg;
+        if (needTg) {
+            try {
+                new TelegramNotifier(config.telegramForTiepreExtrema()).sendHtml(telegramHtml);
+                tgOk = true;
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return false;
+            } catch (IOException e) {
+                LOG.log(Level.WARNING, "Tiepre extrema daily summary Telegram failed: " + e.getMessage(), e);
+                tgOk = false;
+            }
+        }
+        boolean mailOk = !needMail;
+        if (needMail) {
+            try {
+                String plain = TiepreExtremaDailyMessages.telegramAsPlain(telegramHtml);
+                String h = reportHost != null && !reportHost.isBlank() ? reportHost.trim() : "unknown";
+                String plainEmail = plain.isBlank() ? "(" + h + ")" : plain;
+                mail.sendHtmlWithPlain(config.recipients(), subject, plainEmail, emailHtml);
+                mailOk = true;
+            } catch (Exception e) {
+                LOG.log(Level.WARNING, "Tiepre extrema daily summary email failed: " + e.getMessage(), e);
+                mailOk = false;
+            }
+        }
+        return tgOk && mailOk;
     }
 
     private static Path historicalArchiveStatePathFromEnv() {
@@ -968,8 +1670,9 @@ public final class WeatherMailApplication {
     }
 
     /**
-     * Daily 08:00–08:29 ART: compare yesterday’s CABA measures (min/max, rain) with every SMN JSON snapshot logged
-     * that included that calendar day in {@code forecast} (see {@link ForecastDaySnapshotLog#findAllSnapshots}).
+     * Daily 08:00–08:29 ART: compare yesterday’s CABA measures (min/max, rain) with the <b>last</b> SMN JSON snapshot
+     * from each <i>prior</i> ART day that still included that calendar day in {@code forecast} (see
+     * {@link ForecastDaySnapshotLog#findLastSnapshotPerPriorDay}).
      */
     private static void trySendForecastValidation(
             Path measuresDir,
@@ -1032,7 +1735,7 @@ public final class WeatherMailApplication {
                 }
             }
             List<ForecastDaySnapshotLog.SnapshotRow> forecastSnapshots =
-                    snapshotLog.findAllSnapshots(dataDay, CABA_LOCATION_ID);
+                    snapshotLog.findLastSnapshotPerPriorDay(dataDay, CABA_LOCATION_ID);
             String subj = ForecastValidationMessages.subject(dataDay);
             String html =
                     ForecastValidationMessages.buildEmailHtml(
@@ -1234,15 +1937,17 @@ public final class WeatherMailApplication {
                     try {
                         List<MeasuresHistoryReader.MeasureRow> rows =
                                 MeasuresHistoryReader.readInclusive(measuresDir, mStart, mEnd, st.locationId());
-                        Optional<Double> minM = MeasuresSummaryMessages.monthMinTemp(rows);
-                        Optional<Double> maxM = MeasuresSummaryMessages.monthMaxTemp(rows);
-                        if (minM.isPresent() && maxM.isPresent()) {
+                        Optional<MeasuresSummaryMessages.TempPeriod> agg = MeasuresSummaryMessages.aggregateTemps(rows);
+                        if (agg.isPresent()) {
+                            int rainDays = MeasuresHistoryReader.countRainDays(rows);
+                            MeasuresHistoryReader.WindMax windMax =
+                                    MeasuresHistoryReader.maxWindWithDirection(rows).orElse(null);
                             sections.add(
                                     MeasuresSummaryMessages.formatSectionMonthly(
-                                            st.label(), y, mv, minM.get(), maxM.get()));
+                                            st.label(), y, mv, agg.get(), rainDays, windMax));
                             tg.append(
                                     MeasuresSummaryMessages.telegramSectionMonthly(
-                                            st.label(), y, mv, minM.get(), maxM.get()));
+                                            st.label(), y, mv, agg.get(), rainDays, windMax));
                         } else {
                             sections.add(
                                     MeasuresSummaryMessages.sectionNoDataHtml(
@@ -1336,29 +2041,4 @@ public final class WeatherMailApplication {
         return lead + " — SMN weather — " + o.stationName() + " — " + local.format(SUBJECT_TIME) + " ART";
     }
 
-    /**
-     * Env SMN_LOCATION_IDS: comma-separated location ids (e.g. {@code 4864} or {@code 4864,10821}).
-     * If unset, uses CABA and Aeroparque ({@code 4864,10821}).
-     */
-    private static List<SmnClient.Station> stationsFromEnv() {
-        String raw = System.getenv("SMN_LOCATION_IDS");
-        if (raw == null || raw.isBlank()) {
-            raw = "4864,10821";
-        }
-        String[] parts = raw.split(",");
-        List<SmnClient.Station> list = new ArrayList<>();
-        for (String part : parts) {
-            String s = part.trim();
-            if (s.isEmpty()) {
-                continue;
-            }
-            int id = Integer.parseInt(s);
-            String name = KNOWN_STATION_NAMES.getOrDefault(id, "Ubicación SMN " + id);
-            list.add(new SmnClient.Station(id, name));
-        }
-        if (list.isEmpty()) {
-            throw new IllegalStateException("SMN_LOCATION_IDS produced no stations: " + raw);
-        }
-        return List.copyOf(list);
-    }
 }

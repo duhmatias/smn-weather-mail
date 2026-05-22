@@ -5,7 +5,7 @@ import java.security.GeneralSecurityException;
 /**
  * Prints an {@code ENC1:...} string for {@code mail.smtp.password}. Usage:
  * <pre>
- *   SMN_MASTER_PASSWORD='your-passphrase' java -cp "target/smn-weather-mail-1.0.0.jar:target/lib/*" \
+ *   SMN_MASTER_PASSWORD='your-passphrase' java -cp "target/smn-weather-mail-{pom version}.jar:target/lib/*" \
  *     ar.gob.smn.weather.ConfigCryptoCli encrypt 'plaintext-smtp-key'
  * </pre>
  */

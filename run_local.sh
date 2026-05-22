@@ -10,8 +10,8 @@ if [[ -f "$ROOT/run_local.env" ]]; then
   source "$ROOT/run_local.env"
   set +a
 fi
-JAR="$ROOT/target/smn-weather-mail-1.0.0.jar"
 LIB="$ROOT/target/lib"
+JAR=$(ls -t "$ROOT/target"/smn-weather-mail-*.jar 2>/dev/null | head -n1)
 
 mail_user="${MAIL_SMTP_USER:-${GMAIL_SMTP_USER:-}}"
 mail_pass="${MAIL_SMTP_PASSWORD:-${GMAIL_SMTP_PASSWORD:-}}"
@@ -29,8 +29,14 @@ if [[ (-z "$mail_host" || -z "$mail_user" || -z "$mail_pass") && ! -f "$CONFIG_F
   exit 1
 fi
 
-if ! command -v mvn >/dev/null 2>&1; then
-  echo "mvn (Maven) not found in PATH." >&2
+if command -v mvn >/dev/null 2>&1; then
+  MVN_CMD=(mvn)
+elif [[ -x "$ROOT/mvnw" ]]; then
+  # Maven Wrapper bootstraps Maven into ~/.m2/wrapper/dists on first run; only JDK required.
+  MVN_CMD=("$ROOT/mvnw")
+else
+  echo "Neither system 'mvn' nor './mvnw' (Maven Wrapper) is available." >&2
+  echo "  Add the wrapper or install Maven (brew install maven)." >&2
   exit 1
 fi
 
@@ -40,8 +46,8 @@ if [[ ! -f "$SETTINGS" ]]; then
   exit 1
 fi
 
-echo "Building (Maven Central via -s $SETTINGS)..."
-mvn -q -s "$SETTINGS" package -DskipTests
+echo "Building with ${MVN_CMD[0]} (Maven Central via -s $SETTINGS)..."
+"${MVN_CMD[@]}" -q -s "$SETTINGS" package -DskipTests
 
 if [[ ! -f "$JAR" ]]; then
   echo "Expected JAR missing: $JAR" >&2

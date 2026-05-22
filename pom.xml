@@ -6,13 +6,20 @@
 
     <groupId>ar.gob.smn</groupId>
     <artifactId>smn-weather-mail</artifactId>
-    <version>1.0.0</version>
+    <!--
+      Version MAJOR.MINOR.PATCH.BUILD:
+      • MAJOR / MINOR / PATCH: bump manually (see .cursor/rules/versioning.mdc).
+      • BUILD: set automatically each run (timestamp yyyyMMddHHmmss); increases every package build.
+    -->
+    <version>1.2.0.${maven.build.timestamp}</version>
     <packaging>jar</packaging>
     <name>SMN hourly weather email</name>
 
     <properties>
         <maven.compiler.release>11</maven.compiler.release>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <!-- Used as the fourth version segment (numeric, new value each mvn package): -->
+        <maven.build.timestamp.format>yyyyMMddHHmmss</maven.build.timestamp.format>
     </properties>
 
     <dependencies>
@@ -40,6 +47,7 @@
                             <mainClass>ar.gob.smn.weather.WeatherMailApplication</mainClass>
                             <addClasspath>true</addClasspath>
                             <classpathPrefix>lib/</classpathPrefix>
+                            <addDefaultImplementationEntries>true</addDefaultImplementationEntries>
                         </manifest>
                     </archive>
                 </configuration>

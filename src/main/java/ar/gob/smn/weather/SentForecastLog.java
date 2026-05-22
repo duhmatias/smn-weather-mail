@@ -5,6 +5,10 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.LocalDate;
+import java.time.ZoneId;
+import java.time.ZonedDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.Locale;
 
 /**
  * Tracks which CABA forecast bulletins (by SMN {@code updated}) were already sent to Telegram for the
@@ -13,6 +17,12 @@ import java.time.LocalDate;
  * previous slot's bulletin.
  */
 final class SentForecastLog {
+
+    private static final DateTimeFormatter ISO_UPD = DateTimeFormatter.ISO_OFFSET_DATE_TIME;
+    private static final ZoneId ART = ZoneId.of("America/Argentina/Buenos_Aires");
+    private static final DateTimeFormatter STARTUP_DAY = DateTimeFormatter.ofPattern("dd-MM-yy", Locale.ROOT);
+    private static final DateTimeFormatter STARTUP_UPD =
+            DateTimeFormatter.ofPattern("dd-MM-yy HH:mm 'ART'", Locale.ROOT);
 
     private final Path path;
     private LocalDate morningDay;
@@ -185,6 +195,67 @@ final class SentForecastLog {
                 && morningDay.equals(todayArt)
                 && morningUpdated != null
                 && updated.equals(morningUpdated);
+    }
+
+    /**
+     * One line for startup diagnostics: last CABA forecast <i>bulletin</i> recorded after a Telegram send (morning /
+     * afternoon / evening slot with greatest SMN {@code updated} instant).
+     */
+    synchronized String startupSummarySpanish() {
+        Slot best = null;
+        best = maxByUpdated(best, morningDay, morningUpdated, "mañana");
+        best = maxByUpdated(best, afternoonDay, afternoonUpdated, "tarde");
+        best = maxByUpdated(best, eveningDay, eveningUpdated, "noche");
+        if (best == null) {
+            return "Último pronóstico CABA (Telegram): ninguno registrado aún en smn-forecast-sent.txt.";
+        }
+        String updOut =
+                best.parsed != null
+                        ? best.parsed.withZoneSameInstant(ART).format(STARTUP_UPD)
+                        : best.updated;
+        return "Último pronóstico CABA (Telegram): "
+                + best.label
+                + ", día "
+                + best.day.format(STARTUP_DAY)
+                + ", SMN updated "
+                + updOut;
+    }
+
+    private static Slot maxByUpdated(Slot best, LocalDate day, String updated, String label) {
+        if (day == null || updated == null || updated.isBlank()) {
+            return best;
+        }
+        ZonedDateTime z;
+        try {
+            z = ZonedDateTime.parse(updated.trim(), ISO_UPD);
+        } catch (RuntimeException e) {
+            if (best == null) {
+                return new Slot(day, updated, label, null);
+            }
+            return best;
+        }
+        if (best == null || best.parsed == null || z.isAfter(best.parsed)) {
+            return new Slot(day, updated, label, z);
+        }
+        return best;
+    }
+
+    private static final class Slot {
+        final LocalDate day;
+        final String updated;
+        final String label;
+        final ZonedDateTime parsed;
+
+        Slot(LocalDate day, String updated, String label) {
+            this(day, updated, label, null);
+        }
+
+        Slot(LocalDate day, String updated, String label, ZonedDateTime parsed) {
+            this.day = day;
+            this.updated = updated;
+            this.label = label;
+            this.parsed = parsed;
+        }
     }
 
     /** After evening send: same {@code updated} until the next cycle — slower poll. */

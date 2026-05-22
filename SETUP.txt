@@ -1,6 +1,20 @@
 SMN hourly weather email — setup
 ================================
 
+Version (pom.xml <version>MAJOR.MINOR.PATCH</version>):
+  • Bump the 2nd digit (MINOR) when adding features or substantive behavior changes.
+  • Bump the 3rd digit (PATCH) for bug fixes only.
+  • Bump the 1st digit (MAJOR) for breaking / incompatible changes.
+  Scripts pick the newest target/smn-weather-mail-*.jar (run mvn clean package if an old version lingers).
+
+Build tooling
+  • You only need a JDK on PATH. The repo ships Apache Maven Wrapper (./mvnw, ./mvnw.cmd,
+    .mvn/wrapper/), so no system Maven install is required. First run downloads Maven into
+    ~/.m2/wrapper/dists (Maven version pinned in .mvn/wrapper/maven-wrapper.properties).
+  • run.sh / run_local.sh / deploy.sh prefer system 'mvn' if present, else fall back to ./mvnw.
+  • Override the Maven settings file with MVN_SETTINGS=/path/to/settings.xml (defaults to the
+    repo's maven-settings-public.xml so corporate ~/.m2/settings.xml mirrors are bypassed).
+
 Configuration (pick one or combine: env overrides file)
 
 1) config.properties (recommended)
@@ -20,7 +34,8 @@ mail.smtp.host, mail.smtp.user, mail.smtp.password, mail.from, and mail.to.
 
 Or manually:
   mvn package
-  java -cp "target/smn-weather-mail-1.0.0.jar:target/lib/*" ar.gob.smn.weather.WeatherMailApplication
+  java -cp "target/smn-weather-mail-<version>.jar:target/lib/*" ar.gob.smn.weather.WeatherMailApplication
+  (replace <version> with the value in pom.xml, or use run.sh which picks smn-weather-mail-*.jar after mvn package)
 
 SMTP (file keys → same as env):
   mail.smtp.host      → MAIL_SMTP_HOST
@@ -52,8 +67,9 @@ Encrypted SMTP password in the file:
   - At runtime set SMN_MASTER_PASSWORD to the same passphrase you used when encrypting.
   - MAIL_SMTP_PASSWORD in the environment overrides the file and is never treated as ENC1.
   - Generate a value (after mvn package):
-      SMN_MASTER_PASSWORD='your-passphrase' java -cp "target/smn-weather-mail-1.0.0.jar:target/lib/*" \
+      SMN_MASTER_PASSWORD='your-passphrase' java -cp "target/smn-weather-mail-<version>.jar:target/lib/*" \
         ar.gob.smn.weather.ConfigCryptoCli encrypt 'plaintext-smtp-key'
+    (use the pom.xml version in the jar name, or build with run.sh / run_local.sh first and copy the path from target/)
     Paste the printed ENC1:... line into config.properties.
 
 Optional (file or env):
@@ -70,6 +86,15 @@ Optional (file or env):
                       Same layout as SMN_MEASURES_DIR (default: ./smn-forecast-history). Appends one row per
                       CABA forecast snapshot: observation emails (OBS_EMAIL) and morning/evening Telegram
                       bulletins (TG_MORNING / TG_EVENING), with smn_updated, host, and a one-line snippet.
+  SMN_TIEPRE_EXTREMA_HISTORY_DIR
+                      Per-day log of the three extremes chosen by each hourly tiepre extrema send (default:
+                      ./smn-tiepre-extrema-history). Layout: <dir>/<yyyy>/<MM>/<yyyy-MM-dd>.txt. Pipe-
+                      separated rows: <sent_at_art>|<TYPE>|<station>|<obs_at_art>|<value>|<wind_dir>
+                      (TYPE = MAX_T / MIN_T / MAX_W). Used by the daily 08:00 ART tiepre extrema summary
+                      (see SMN_TIEPRE_EXTREMA_DAILY_SENT_FILE).
+  SMN_TIEPRE_EXTREMA_DAILY_SENT_FILE
+                      Dedupe file for the daily 08:00 ART tiepre extrema summary (default:
+                      ./smn-tiepre-extrema-daily-sent.txt). One TIEPRE_DAILY|YYYY-MM-DD line per send.
 
 Legacy aliases (env only, same values as MAIL_*):
   GMAIL_SMTP_HOST, GMAIL_SMTP_USER, GMAIL_SMTP_PASSWORD, GMAIL_SMTP_PORT
@@ -104,9 +129,9 @@ Behaviour:
   - Appends the same snapshot as an aligned row under smn-measures/<yyyy>/<MM>/<yyyy-MM-dd>.txt
     (Buenos Aires calendar day). If writing measures fails, a warning is logged; the email still counts as sent.
 
-Stations (env SMN_LOCATION_IDS):
+Stations (config smn.location.ids, or env SMN_LOCATION_IDS — env overrides the file):
   - Default: 4864 (CABA) and 10821 (Aeroparque Buenos Aires), comma-separated.
-  - CABA only: export SMN_LOCATION_IDS=4864
+  - CABA only: set smn.location.ids=4864 in config.properties, or export SMN_LOCATION_IDS=4864
   - If location 10821 often returns HTTP 401, SMN is blocking that endpoint for your IP/client;
     CABA-only avoids it. The app uses browser-like headers to reduce 401s when possible.
 

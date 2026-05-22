@@ -1,6 +1,8 @@
 config.properties
+deploy.secrets.sh
 run_local.env
 smn-weather-sent.txt
+smn-telegram-conditions-subscriber-chats.txt
 smn-measures/
 target/
 .idea/

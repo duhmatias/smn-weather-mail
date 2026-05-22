@@ -1,7 +1,12 @@
 package ar.gob.smn.weather;
 
+import java.time.DateTimeException;
 import java.time.LocalDate;
+import java.time.OffsetDateTime;
+import java.time.ZoneId;
+import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
 import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
@@ -10,7 +15,10 @@ import java.util.Optional;
 final class ForecastValidationMessages {
 
     private static final Locale ES_AR = Locale.forLanguageTag("es-AR");
+    private static final ZoneId ART = ZoneId.of("America/Argentina/Buenos_Aires");
     private static final DateTimeFormatter DAY = DateTimeFormatter.ofPattern("EEEE d MMM uuuu", ES_AR);
+    private static final DateTimeFormatter LOG_DAY_SHORT = DateTimeFormatter.ofPattern("d MMM uuuu", ES_AR);
+    private static final DateTimeFormatter CLOCK = DateTimeFormatter.ofPattern("HH:mm", ES_AR);
     /** Leave margin under Telegram’s 4096 limit for {@code sendHtml}. */
     private static final int TELEGRAM_BODY_BUDGET = 3800;
 
@@ -38,24 +46,38 @@ final class ForecastValidationMessages {
             sb.append("<p>Mín / máx temperatura: ")
                     .append(fmt(p.minTemp()))
                     .append(" / ")
-                    .append(fmt(p.maxTemp()))
-                    .append("</p>\n");
+                    .append(fmt(p.maxTemp()));
+            if (p.minTempAt().isPresent()) {
+                sb.append(" — hora mín. ART: ").append(esc(fmtClock(p.minTempAt().get())));
+            }
+            if (p.maxTempAt().isPresent()) {
+                sb.append(" — hora máx. ART: ").append(esc(fmtClock(p.maxTempAt().get())));
+            }
+            sb.append("</p>\n");
         } else {
             sb.append("<p>(Sin mediciones en el archivo local para ese día.)</p>\n");
         }
         sb.append("<p>Lluvia (condiciones reportadas): ").append(observedRain ? "sí" : "no").append("</p>\n");
 
-        sb.append("<h3>Pronóstico (todos los boletines SMN guardados que incluían ese día)</h3>\n");
+        sb.append("<h3>Último pronóstico de cada día anterior (ART) que incluía este día</h3>\n");
         if (forecastSnapshots.isEmpty()) {
-            sb.append("<p><i>No hay en el historial local ningún JSON SMN que incluya ese día. ")
-                    .append("Hace falta haber corrido este servicio cuando SMN ya exponía ese día en el pronóstico.</i></p>\n");
+            sb.append("<p><i>No hay en el historial local, para días anteriores al observado, ningún JSON SMN que ")
+                    .append("incluyera este día en <code>forecast[]</code>. Hace falta haber corrido este servicio cuando ")
+                    .append("SMN ya exponía ese día en el pronóstico.</i></p>\n");
         } else {
             sb.append("<p>")
                     .append(forecastSnapshots.size())
-                    .append(" registro(s), en orden cronológico (cuando se guardó cada JSON).</p>\n");
+                    .append(" día(s): por cada día calendario previo al observado, el <b>último</b> boletín guardado ese ")
+                    .append("día que aún contenía el pronóstico para ")
+                    .append(esc(dataDay.toString()))
+                    .append(" (orden: día más reciente primero).</p>\n");
             sb.append("<ol>\n");
             for (ForecastDaySnapshotLog.SnapshotRow f : forecastSnapshots) {
-                sb.append("<li><p>Registrado (ART): ").append(esc(f.writtenArt().toString())).append("</p>\n");
+                sb.append("<li><p><b>Día del boletín (ART):</b> ")
+                        .append(esc(f.logDayArt().format(LOG_DAY_SHORT)))
+                        .append(" — <b>registrado:</b> ")
+                        .append(esc(f.writtenArt().toString()))
+                        .append("</p>\n");
                 if (!f.smnUpdated().isBlank()) {
                     sb.append("<p>SMN <code>updated</code>: ").append(esc(f.smnUpdated())).append("</p>\n");
                 }
@@ -72,8 +94,9 @@ final class ForecastValidationMessages {
         }
 
         sb.append("<p style=\"color:#555;font-size:90%\">")
-                .append("Comparación orientativa; se listan todos los pronósticos almacenados por esta app ")
-                .append("en los que SMN incluía ese día en el array <code>forecast</code>.")
+                .append("Comparación orientativa: una fila por día anterior al observado; cada fila es el último JSON ")
+                .append("almacenado ese día (ART) en el que SMN seguía incluyendo el día comparado en ")
+                .append("<code>forecast</code>.")
                 .append("</p>\n");
         sb.append("<p>(").append(h).append(")</p>\n");
         return sb.toString();
@@ -97,14 +120,20 @@ final class ForecastValidationMessages {
             sb.append("Mín / máx: ")
                     .append(fmt(p.minTemp()))
                     .append(" / ")
-                    .append(fmt(p.maxTemp()))
-                    .append("\n");
+                    .append(fmt(p.maxTemp()));
+            if (p.minTempAt().isPresent()) {
+                sb.append(" — mín. ").append(escTg(fmtClock(p.minTempAt().get())));
+            }
+            if (p.maxTempAt().isPresent()) {
+                sb.append(" — máx. ").append(escTg(fmtClock(p.maxTempAt().get())));
+            }
+            sb.append("\n");
         } else {
             sb.append("(Sin mediciones locales.)\n");
         }
         sb.append("Lluvia: ").append(observedRain ? "sí" : "no").append("\n\n");
 
-        sb.append("<b>Pronóstico (todos los que incluían ese día)</b>\n");
+        sb.append("<b>Último pronóstico por día anterior (ART) que incluía este día</b>\n");
         if (forecastSnapshots.isEmpty()) {
             sb.append("(Sin datos en historial local.)\n");
         } else {
@@ -137,11 +166,10 @@ final class ForecastValidationMessages {
             ForecastDaySnapshotLog.SnapshotRow f = forecasts.get(i);
             StringBuilder block = new StringBuilder();
             block.append(i + 1)
-                    .append(") ")
-                    .append(escTg(f.writtenArt().toString()));
-            if (!f.smnUpdated().isBlank()) {
-                block.append(" · upd ").append(escTg(f.smnUpdated()));
-            }
+                    .append(") día boletín ")
+                    .append(escTg(f.logDayArt().format(LOG_DAY_SHORT)))
+                    .append(" — ")
+                    .append(escTg(snapshotSmnHoraArt(f.smnUpdated(), f.writtenArt())));
             block.append("\n   min/max ")
                     .append(ForecastDaySnapshotLog.fmtTemp(f.tempMin()))
                     .append(" / ")
@@ -156,8 +184,38 @@ final class ForecastValidationMessages {
         return shown;
     }
 
+    /**
+     * Human-readable SMN bulletin time for Telegram: {@code hora ART HH:mm} from JSON {@code updated} when parseable,
+     * otherwise the snapshot {@code written} instant’s clock in ART.
+     */
+    private static String snapshotSmnHoraArt(String smnUpdated, ZonedDateTime writtenArt) {
+        return "hora ART " + parseSmnUpdatedInstant(smnUpdated).orElse(writtenArt).withZoneSameInstant(ART).format(CLOCK);
+    }
+
+    private static Optional<ZonedDateTime> parseSmnUpdatedInstant(String smnUpdated) {
+        if (smnUpdated == null || smnUpdated.isBlank()) {
+            return Optional.empty();
+        }
+        String t = smnUpdated.trim();
+        try {
+            return Optional.of(OffsetDateTime.parse(t, DateTimeFormatter.ISO_OFFSET_DATE_TIME).atZoneSameInstant(ART));
+        } catch (DateTimeParseException e) {
+            try {
+                return Optional.of(ZonedDateTime.parse(t));
+            } catch (DateTimeParseException e2) {
+                return Optional.empty();
+            }
+        } catch (DateTimeException e) {
+            return Optional.empty();
+        }
+    }
+
     private static String fmt(double t) {
         return String.format(Locale.ROOT, "%.1f °C", t);
+    }
+
+    private static String fmtClock(ZonedDateTime z) {
+        return z.withZoneSameInstant(ART).format(CLOCK);
     }
 
     private static String esc(String s) {

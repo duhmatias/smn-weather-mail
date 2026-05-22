@@ -12,6 +12,7 @@ import java.time.temporal.ChronoUnit;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 
 /**
@@ -43,6 +44,26 @@ final class SentWeatherLog {
 
     static String key(int locationId, Instant observationInstant) {
         return locationId + "|" + observationInstant;
+    }
+
+    /** Latest mailed observation instant for this station, if any keys exist. */
+    synchronized Optional<Instant> latestMailedObservationInstant(int locationId) {
+        Instant best = null;
+        String prefix = locationId + "|";
+        for (String k : sent) {
+            if (!k.startsWith(prefix)) {
+                continue;
+            }
+            try {
+                Instant ins = Instant.parse(k.substring(prefix.length()));
+                if (best == null || ins.isAfter(best)) {
+                    best = ins;
+                }
+            } catch (RuntimeException ignored) {
+                // malformed
+            }
+        }
+        return Optional.ofNullable(best);
     }
 
     /**

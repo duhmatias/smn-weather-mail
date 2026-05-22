@@ -8,8 +8,16 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
 import java.time.Duration;
+import java.time.ZoneId;
+import java.time.ZonedDateTime;
+import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /** Sends plain-text messages via the Telegram Bot API (same content as the weather email). */
@@ -17,15 +25,28 @@ final class TelegramNotifier {
 
     private static final Logger LOG = Logger.getLogger(TelegramNotifier.class.getName());
     private static final int TELEGRAM_TEXT_LIMIT = 4096;
+    private static final ZoneId CONDITIONS_QUIET_TZ = ZoneId.of("America/Argentina/Buenos_Aires");
 
     private final HttpClient http =
             HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(15)).build();
     private final String botToken;
-    private final List<String> chatIds;
+    private final List<String> baseChatIds;
+    /** If non-{@code null}, merged on each send with {@link #baseChatIds} (see {@code /subscribe current} / {@code
+     * /unsubscribe current}). */
+    private final Path conditionsSubscriberChatsFile;
 
     TelegramNotifier(Config.Telegram telegram) {
+        this(telegram, null);
+    }
+
+    /**
+     * @param conditionsSubscriberChatsFile optional file of extra {@code chat_id} lines (same bot as {@code telegram});
+     *     read on every send
+     */
+    TelegramNotifier(Config.Telegram telegram, Path conditionsSubscriberChatsFile) {
         this.botToken = telegram.botToken();
-        this.chatIds = telegram.chatIds();
+        this.baseChatIds = telegram.chatIds();
+        this.conditionsSubscriberChatsFile = conditionsSubscriberChatsFile;
     }
 
     void sendWeatherMessage(String emailSubject, String emailBody) throws IOException, InterruptedException {
@@ -37,7 +58,7 @@ final class TelegramNotifier {
         if (text.length() > TELEGRAM_TEXT_LIMIT) {
             text = text.substring(0, TELEGRAM_TEXT_LIMIT - 3) + "...";
         }
-        for (String chatId : chatIds) {
+        for (String chatId : recipientChatIds()) {
             sendToChat(chatId.trim(), text, false);
         }
     }
@@ -47,9 +68,115 @@ final class TelegramNotifier {
         if (html.length() > TELEGRAM_TEXT_LIMIT) {
             html = html.substring(0, TELEGRAM_TEXT_LIMIT - 3) + "...";
         }
-        for (String chatId : chatIds) {
+        for (String chatId : recipientChatIds()) {
             sendToChat(chatId.trim(), html, true);
         }
+    }
+
+    /**
+     * Like {@link #sendHtml(String)} for condition bulletins, but only sends to subscribers that want this
+     * {@code locationId} (file line {@code locs=…} or all locations when the line has no locs; config ids always
+     * receive). Subject to day-schedule quiet hours.
+     */
+    void sendConditionHtml(String html, int locationId) throws IOException, InterruptedException {
+        if (html.length() > TELEGRAM_TEXT_LIMIT) {
+            html = html.substring(0, TELEGRAM_TEXT_LIMIT - 3) + "...";
+        }
+        List<String> ids;
+        try {
+            ids = conditionRecipientChatIds(locationId);
+        } catch (IOException e) {
+            LOG.log(
+                    Level.WARNING,
+                    "Condition Telegram recipient list failed, sending without loc= filter: " + e.getMessage(),
+                    e);
+            sendHtml(html);
+            return;
+        }
+        for (String chatId : ids) {
+            sendToChat(chatId.trim(), html, true);
+        }
+    }
+
+    private List<String> conditionRecipientChatIds(int locationId) throws IOException {
+        if (conditionsSubscriberChatsFile == null) {
+            return recipientChatIds();
+        }
+        List<String> merged =
+                TelegramConditionsSubscriberChats.mergeBaseWithFile(baseChatIds, conditionsSubscriberChatsFile);
+        Set<String> daySchedule =
+                TelegramConditionsSubscriberChats.readDayScheduleChatIds(conditionsSubscriberChatsFile);
+        Map<String, Set<Integer>> locRestrict =
+                TelegramConditionsSubscriberChats.readLocationFilterForFileSubscribers(
+                        conditionsSubscriberChatsFile);
+        Set<String> base = new HashSet<>();
+        for (String b : baseChatIds) {
+            if (b != null) {
+                base.add(b.trim());
+            }
+        }
+        List<String> out = new ArrayList<>(merged.size());
+        for (String raw : merged) {
+            String c = raw.trim();
+            if (daySchedule.contains(c) && isInOvernightQuietWindowArt()) {
+                LOG.fine(() -> "Telegram conditions: skip chat " + c + " (day-schedule, 00:00–05:59 ART quiet)");
+                continue;
+            }
+            if (base.contains(c)) {
+                out.add(c);
+                continue;
+            }
+            Set<Integer> need = locRestrict.get(c);
+            if (need != null && !need.contains(locationId)) {
+                LOG.fine(() -> "Telegram conditions: skip chat " + c + " (locs= does not include " + locationId + ")");
+                continue;
+            }
+            out.add(c);
+        }
+        return out;
+    }
+
+    private List<String> recipientChatIds() {
+        if (conditionsSubscriberChatsFile == null) {
+            return baseChatIds;
+        }
+        try {
+            // no per-station filter (non-conditions or callers that are not a single location)
+            return conditionRecipientChatIdsUnfiltered();
+        } catch (IOException e) {
+            LOG.log(Level.WARNING, "Could not read conditions subscriber chats file: " + e.getMessage(), e);
+            return baseChatIds;
+        }
+    }
+
+    /** Merged list with day-schedule filter only (no per-location file filter). */
+    private List<String> conditionRecipientChatIdsUnfiltered() throws IOException {
+        List<String> merged =
+                TelegramConditionsSubscriberChats.mergeBaseWithFile(baseChatIds, conditionsSubscriberChatsFile);
+        Set<String> daySchedule =
+                TelegramConditionsSubscriberChats.readDayScheduleChatIds(conditionsSubscriberChatsFile);
+        if (daySchedule.isEmpty() || !isInOvernightQuietWindowArt()) {
+            return merged;
+        }
+        List<String> out = new ArrayList<>(merged.size());
+        for (String chatId : merged) {
+            String c = chatId.trim();
+            if (daySchedule.contains(c)) {
+                LOG.fine(() -> "Telegram conditions: skip chat " + c + " (day-schedule, 00:00–05:59 ART quiet)");
+                continue;
+            }
+            out.add(c);
+        }
+        return out;
+    }
+
+    /**
+     * Overnight quiet for {@code ;day-schedule} subscribers: local clock 00:00 through 05:59 in
+     * America/Argentina/Buenos_Aires — no condition bulletins in that window.
+     */
+    private static boolean isInOvernightQuietWindowArt() {
+        int hour = ZonedDateTime.now(CONDITIONS_QUIET_TZ).getHour();
+        return hour >= 0 && hour < 6;
     }
 
     private void sendToChat(String chatId, String text, boolean html) throws IOException, InterruptedException {

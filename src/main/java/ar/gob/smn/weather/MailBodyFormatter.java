@@ -159,13 +159,22 @@ final class MailBodyFormatter {
 
     static String conditionsStyleHeaderLine(SmnClient.Observation o, int locationId, char tagSeparator) {
         String title = o.stationName().toUpperCase(ES_AR);
-        return title + tagSeparator + locationTag(locationId);
+        return title + tagSeparator + locationTag(tagLocationId(o, locationId));
+    }
+
+    /**
+     * Plain current-conditions block only (same wording as email/Telegram; no host line, no forecast).
+     */
+    static String formatCurrentConditionsPlain(SmnClient.Observation o, int locationId) {
+        StringBuilder sb = new StringBuilder();
+        appendConditionsBlockPlain(sb, o, locationId);
+        return sb.toString();
     }
 
     private static void appendConditionsBlockPlain(StringBuilder sb, SmnClient.Observation o, int locationId) {
         ZonedDateTime local = o.observationTime().withZoneSameInstant(ART);
         String title = o.stationName().toUpperCase(ES_AR);
-        String tag = locationTag(locationId);
+        String tag = locationTag(tagLocationId(o, locationId));
         sb.append(title)
                 .append('@')
                 .append(tag)
@@ -210,7 +219,7 @@ final class MailBodyFormatter {
             StringBuilder sb, SmnClient.Observation o, int locationId, String eol, char stationTagSeparator) {
         ZonedDateTime local = o.observationTime().withZoneSameInstant(ART);
         String title = o.stationName().toUpperCase(ES_AR);
-        String tag = locationTag(locationId);
+        String tag = locationTag(tagLocationId(o, locationId));
         sb.append("<b>")
                 .append(escHtml(title))
                 .append(stationTagSeparator == '/' ? "/" : "@")
@@ -332,8 +341,17 @@ final class MailBodyFormatter {
         return String.format(Locale.ROOT, "%.1f", d);
     }
 
+    /** Prefer SMN JSON {@code location.id} when present (e.g. alternate id used for fetch). */
+    private static int tagLocationId(SmnClient.Observation o, int fallback) {
+        Integer x = o.smnLocationId();
+        return x != null ? x : fallback;
+    }
+
     /** Short tag after @ in the header line (screenshot: CABA). */
     private static String locationTag(int locationId) {
+        if (locationId < 0) {
+            return "TXT";
+        }
         if (locationId == 4864) {
             return "CABA";
         }
