@@ -61,6 +61,7 @@ final class WeatherHttpServer {
         server.createContext("/api/health", this::handleHealth);
         server.createContext("/api/stations", this::handleStations);
         server.createContext("/api/current", this::handleCurrent);
+        server.createContext("/api/forecast", this::handleForecast);
         server.start();
         LOG.info("HTTP JSON API started on port " + port
                 + " (endpoints: GET /api/current?q=…, GET /api/stations, GET /api/health)");
@@ -174,6 +175,43 @@ final class WeatherHttpServer {
             body.put("reportHost", reportHost);
         }
         sendJson(exchange, 200, body);
+    }
+
+    // ── /api/forecast ────────────────────────────────────────────────────────────
+
+    private void handleForecast(HttpExchange exchange) throws IOException {
+        if (!checkGet(exchange)) return;
+
+        // Use the first configured station (CABA) for forecast
+        if (configuredStations.isEmpty()) {
+            sendJsonError(exchange, 500, "No stations configured");
+            return;
+        }
+
+        SmnClient.Station station = configuredStations.get(0);
+
+        try {
+            SmnClient.ForecastPayload forecast = smn.fetchForecastPayload(station);
+
+            Map<String, Object> body = new LinkedHashMap<>();
+            body.put("locationId", station.locationId());
+            body.put("label", station.label());
+            body.put("updated", forecast.updated());
+            body.put("plainText", forecast.plainText());
+            body.put("telegramHtml", forecast.telegramHtml());
+
+            if (reportHost != null) {
+                body.put("reportHost", reportHost);
+            }
+
+            sendJson(exchange, 200, body);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            sendJsonError(exchange, 500, "Request interrupted");
+        } catch (IOException e) {
+            LOG.log(Level.WARNING, "Error fetching forecast", e);
+            sendJsonError(exchange, 502, "Error fetching forecast from SMN: " + e.getMessage());
+        }
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────────
