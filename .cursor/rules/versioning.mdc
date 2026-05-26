@@ -1,0 +1,19 @@
+---
+description: Bump smn-weather-mail pom version — MINOR for features, PATCH for bug fixes; BUILD auto per package
+alwaysApply: true
+---
+
+# Version (`smn-weather-mail`)
+
+The project version is **`pom.xml`** → `<version>MAJOR.MINOR.PATCH.BUILD</version>`.
+
+- **MAJOR.MINOR.PATCH** — edit manually in `pom.xml` (first three numeric segments only; do not replace `${maven.build.timestamp}`).
+- **BUILD** — fourth segment, **automatic**: `${maven.build.timestamp}` formatted as `yyyyMMddHHmmss`. It **changes on every** `mvn package` (or any build that resolves the POM), so each build gets a distinct full version (e.g. `1.1.0.20260420200833`).
+
+| When | Bump |
+|------|------|
+| New features, new behavior, or substantive non-trivial changes | **MINOR** (2nd digit). Reset **PATCH** to `0` when increasing MINOR (e.g. `1.1.x.*` → set `1.2.0.${maven.build.timestamp}` template — keep the property placeholder). |
+| Bug fixes only (no intentional behavior change) | **PATCH** (3rd digit) (e.g. change `1.1.0` → `1.1.1` in the version prefix before `${maven.build.timestamp}`). |
+| Breaking or incompatible changes (config, CLI, deploy contract) | **MAJOR** (1st digit). |
+
+After changing MAJOR.MINOR.PATCH, **do not** hardcode the JAR file name in scripts: `run.sh` / `run_local.sh` resolve the **newest** `target/smn-weather-mail-*.jar` by time; `Dockerfile` copies the single jar built in that image to `app.jar`. Prefer `mvn clean package` after a version bump so only one main JAR remains under `target/`.
