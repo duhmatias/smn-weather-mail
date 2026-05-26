@@ -15,5 +15,8 @@ WORKDIR /app
 COPY --from=build /build/app.jar /app/app.jar
 COPY --from=build /build/target/lib/ /app/lib/
 
+# Optional JSON API (when HTTP_SERVER_ENABLED=true); default port 8300 for alwaysdata compatibility
+EXPOSE 8300
+
 # Classpath: manifest expects lib/ next to the main jar; matches run.sh
 CMD ["java", "-cp", "/app/app.jar:/app/lib/*", "ar.gob.smn.weather.WeatherMailApplication"]

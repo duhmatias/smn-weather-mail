@@ -89,6 +89,10 @@ final class Config {
      * {@code telegram.chat.ids}). {@code null} when main Telegram is not configured.
      */
     private final Path telegramConditionsSubscriberChatsFile;
+    /** Whether the built-in JSON HTTP server is enabled ({@code http.server.enabled} / {@code HTTP_SERVER_ENABLED}). */
+    private final boolean httpServerEnabled;
+    /** Port for the JSON HTTP server ({@code http.server.port} / {@code HTTP_SERVER_PORT}); default 8300. */
+    private final int httpServerPort;
 
     private static final Map<Integer, String> SMN_KNOWN_LOCATION_LABELS = Map.of(
             4864, "Ciudad Autónoma de Buenos Aires",
@@ -118,7 +122,9 @@ final class Config {
             List<SmnClient.Station> smnWeatherLocations,
             Path telegramConditionsSubscriberChatsFile,
             String reportHostLabel,
-            String smnWsCookieHeader) {
+            String smnWsCookieHeader,
+            boolean httpServerEnabled,
+            int httpServerPort) {
         this.smtpHost = smtpHost;
         this.smtpPort = smtpPort;
         this.smtpUser = smtpUser;
@@ -143,6 +149,8 @@ final class Config {
         this.telegramConditionsSubscriberChatsFile = telegramConditionsSubscriberChatsFile;
         this.reportHostLabel = reportHostLabel;
         this.smnWsCookieHeader = smnWsCookieHeader;
+        this.httpServerEnabled = httpServerEnabled;
+        this.httpServerPort = httpServerPort;
     }
 
     /** Optional Telegram mirror; {@code null} if {@code telegram.bot.token} / {@code TELEGRAM_BOT_TOKEN} unset. */
@@ -286,6 +294,13 @@ final class Config {
         Path telegramConditionsSubscriberChatsFile =
                 telegram != null ? resolveTelegramConditionsSubscriberChatsFile(fileProps) : null;
 
+        boolean httpServerEnabled =
+                parseBool(firstNonBlank(System.getenv("HTTP_SERVER_ENABLED"), null, fileProps, "http.server.enabled"));
+        // HTTP_SERVER_PORT > PORT (PaaS standard) > http.server.port in file > 8300 (alwaysdata services range)
+        String httpPortStr = firstNonBlank(
+                System.getenv("HTTP_SERVER_PORT"), System.getenv("PORT"), fileProps, "http.server.port");
+        int httpServerPort = httpPortStr == null || httpPortStr.isBlank() ? 8300 : Integer.parseInt(httpPortStr.trim());
+
         return new Config(
                 host,
                 port,
@@ -310,7 +325,9 @@ final class Config {
                 smnWeatherLocations,
                 telegramConditionsSubscriberChatsFile,
                 reportHost,
-                smnWsCookieHeader);
+                smnWsCookieHeader,
+                httpServerEnabled,
+                httpServerPort);
     }
 
     private static Path resolveTelegramConditionsSubscriberChatsFile(Properties fileProps) {
@@ -898,6 +915,16 @@ final class Config {
      */
     String smnWsCookieHeader() {
         return smnWsCookieHeader;
+    }
+
+    /** Whether the built-in JSON HTTP server is enabled. Default {@code false}. */
+    boolean httpServerEnabled() {
+        return httpServerEnabled;
+    }
+
+    /** Port for the JSON HTTP server. Default {@code 8300} (alwaysdata services range 8300–8499). */
+    int httpServerPort() {
+        return httpServerPort;
     }
 
     /**

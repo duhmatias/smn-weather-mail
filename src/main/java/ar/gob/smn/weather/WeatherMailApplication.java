@@ -267,6 +267,17 @@ public final class WeatherMailApplication {
                             + " telegram.current.bot.token está definido)");
         }
 
+        if (config.httpServerEnabled()) {
+            try {
+                WeatherHttpServer httpServer = new WeatherHttpServer(
+                        config.httpServerPort(), smn, stations, reportHost);
+                httpServer.start();
+            } catch (IOException e) {
+                LOG.log(Level.SEVERE, "HTTP JSON API failed to start on port " + config.httpServerPort()
+                        + " — polling continues without web API", e);
+            }
+        }
+
         tryCatchUpMissingForecastTelegramOnStartup(
                 smn,
                 telegramForecast,
