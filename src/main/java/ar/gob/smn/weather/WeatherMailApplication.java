@@ -258,13 +258,14 @@ public final class WeatherMailApplication {
                                     smn,
                                     config.smnWeatherLocations(),
                                     config.telegramConditionsSubscriberChatsFile(),
-                                    config.telegram() != null ? config.telegram().chatIds() : List.of()),
+                                    config.telegram() != null ? config.telegram().chatIds() : List.of(),
+                                    measuresDir,
+                                    forecastDaySnapshotLog),
                             "telegram-commands");
             cmdThread.setDaemon(true);
             cmdThread.start();
             LOG.info(
-                    "Telegram command listener: on (getUpdates /hello; /subscribe|unsubscribe current [day-schedule]; /current → buscador SMN si"
-                            + " telegram.current.bot.token está definido)");
+                    "Telegram command listener: on (getUpdates /hello; /subscribe|unsubscribe current [day-schedule]; /current; /validation)");
         }
 
         if (config.httpServerEnabled()) {

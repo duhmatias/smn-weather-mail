@@ -16,6 +16,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.logging.Level;
@@ -97,6 +98,9 @@ final class TelegramBotCommandListener implements Runnable {
      * {@code telegram.chat.ids} for conditions (for de-dupe on subscribe). Empty when main Telegram is off.
      */
     private final List<String> conditionsBaseChatIds;
+    /** For {@code /validation} command. */
+    private final Path measuresDir;
+    private final ForecastDaySnapshotLog snapshotLog;
 
     TelegramBotCommandListener(
             String botToken,
@@ -105,7 +109,9 @@ final class TelegramBotCommandListener implements Runnable {
             SmnClient smn,
             List<SmnClient.Station> smnPrimeStations,
             Path conditionsSubscriberChatsFile,
-            List<String> conditionsBaseChatIds) {
+            List<String> conditionsBaseChatIds,
+            Path measuresDir,
+            ForecastDaySnapshotLog snapshotLog) {
         this.botToken = botToken;
         this.reportHost = reportHost != null && !reportHost.isBlank() ? reportHost.trim() : "unknown-host";
         this.currentConditionsBotToken =
@@ -116,6 +122,8 @@ final class TelegramBotCommandListener implements Runnable {
         this.smnPrimeStations = smnPrimeStations != null ? List.copyOf(smnPrimeStations) : List.of();
         this.conditionsSubscriberChatsFile = conditionsSubscriberChatsFile;
         this.conditionsBaseChatIds = conditionsBaseChatIds != null ? List.copyOf(conditionsBaseChatIds) : List.of();
+        this.measuresDir = measuresDir;
+        this.snapshotLog = snapshotLog;
     }
 
     @Override
@@ -202,6 +210,10 @@ final class TelegramBotCommandListener implements Runnable {
         }
         if (isCurrentCommand(text)) {
             handleCurrentCommand(chatId, text);
+            return;
+        }
+        if (isCommand(text, "/validation")) {
+            handleValidationCommand(chatId);
         }
     }
 
@@ -443,6 +455,56 @@ final class TelegramBotCommandListener implements Runnable {
         }
     }
 
+    private void handleValidationCommand(String chatId) {
+        if (measuresDir == null || snapshotLog == null) {
+            try {
+                sendMessage(chatId, "Forecast validation is not configured.");
+            } catch (IOException | InterruptedException e) {
+                logSendFailure(e);
+            }
+            return;
+        }
+        LOG.info("/validation chatId=" + chatId);
+        try {
+            java.time.ZoneId artZone = java.time.ZoneId.of("America/Argentina/Buenos_Aires");
+            java.time.LocalDate today = java.time.ZonedDateTime.now(artZone).toLocalDate();
+            java.time.LocalDate dataDay = today.minusDays(1);
+
+            // CABA station (locationId 4864)
+            int cabaLocationId = 4864;
+            String cabaLabel = "Capital Federal";
+
+            List<MeasuresHistoryReader.MeasureRow> rows =
+                    MeasuresHistoryReader.readDay(measuresDir, dataDay, cabaLocationId);
+            Optional<MeasuresSummaryMessages.TempPeriod> observed = MeasuresSummaryMessages.aggregateTemps(rows);
+
+            boolean observedRain = false;
+            for (MeasuresHistoryReader.MeasureRow r : rows) {
+                if (MeasuresHistoryReader.looksLikeRain(r.conditions())) {
+                    observedRain = true;
+                    break;
+                }
+            }
+
+            List<ForecastDaySnapshotLog.SnapshotRow> forecastSnapshots =
+                    snapshotLog.findLastSnapshotPerPriorDay(dataDay, cabaLocationId);
+
+            String tg = ForecastValidationMessages.buildTelegramHtml(
+                    cabaLabel, dataDay, observed, observedRain, forecastSnapshots, reportHost);
+
+            sendLongAsBot(botToken, chatId, tg, true);
+        } catch (IOException e) {
+            LOG.log(Level.WARNING, "/validation failed: " + e.getMessage(), e);
+            try {
+                sendMessage(chatId, "Could not generate validation: " + e.getMessage());
+            } catch (IOException | InterruptedException e2) {
+                logSendFailure(e2);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
     private static void sleepMs(int ms) {
         try {
             Thread.sleep(ms);
@@ -602,9 +664,13 @@ final class TelegramBotCommandListener implements Runnable {
     }
 
     private void sendLongAsBot(String token, String chatId, String text) throws IOException, InterruptedException {
+        sendLongAsBot(token, chatId, text, false);
+    }
+
+    private void sendLongAsBot(String token, String chatId, String text, boolean html) throws IOException, InterruptedException {
         List<String> parts = chunkForTelegram(text, MESSAGE_CHUNK);
         for (int i = 0; i < parts.size(); i++) {
-            postSendMessage(token, chatId, parts.get(i));
+            postSendMessage(token, chatId, parts.get(i), html);
             if (i + 1 < parts.size()) {
                 Thread.sleep(400);
             }
@@ -638,11 +704,16 @@ final class TelegramBotCommandListener implements Runnable {
     }
 
     private void postSendMessage(String token, String chatId, String text) throws IOException, InterruptedException {
+        postSendMessage(token, chatId, text, false);
+    }
+
+    private void postSendMessage(String token, String chatId, String text, boolean html) throws IOException, InterruptedException {
         String form =
                 "chat_id="
                         + enc(chatId)
                         + "&text="
                         + enc(text)
+                        + (html ? "&parse_mode=HTML" : "")
                         + "&disable_web_page_preview=true";
         URI uri = telegramMethodUri(token, "sendMessage");
         HttpRequest req = HttpRequest.newBuilder(uri)

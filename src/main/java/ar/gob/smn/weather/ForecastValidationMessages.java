@@ -40,10 +40,37 @@ final class ForecastValidationMessages {
         sb.append("<h2>").append(esc(subject(dataDay))).append("</h2>\n");
         sb.append("<p><b>").append(esc(stationLabel)).append("</b> — día ").append(esc(dataDay.format(DAY))).append("</p>\n");
 
-        sb.append("<h3>Observado (registro horario SMN)</h3>\n");
-        if (observed.isPresent()) {
+        sb.append("<h3>Comparación observado vs pronóstico</h3>\n");
+        if (observed.isPresent() && !forecastSnapshots.isEmpty()) {
             MeasuresSummaryMessages.TempPeriod p = observed.get();
-            sb.append("<p>Mín / máx temperatura: ")
+            ForecastDaySnapshotLog.SnapshotRow closest = forecastSnapshots.get(0);  // First = most recent
+            ForecastDaySnapshotLog.SnapshotRow farthest = forecastSnapshots.get(forecastSnapshots.size() - 1);
+
+            sb.append("<p><b>Mínima</b><br>");
+            sb.append("Real: ").append(fmt(p.minTemp()));
+            if (p.minTempAt().isPresent()) {
+                sb.append(" (").append(esc(fmtClock(p.minTempAt().get()))).append(")");
+            }
+            sb.append("<br>Pronóstico cercano: ").append(ForecastDaySnapshotLog.fmtTemp(closest.tempMin()));
+            sb.append(" (").append(esc(closest.logDayArt().format(LOG_DAY_SHORT))).append(")");
+            sb.append("<br>Pronóstico lejano: ").append(ForecastDaySnapshotLog.fmtTemp(farthest.tempMin()));
+            sb.append(" (").append(esc(farthest.logDayArt().format(LOG_DAY_SHORT))).append(")");
+            sb.append("</p>\n");
+
+            sb.append("<p><b>Máxima</b><br>");
+            sb.append("Real: ").append(fmt(p.maxTemp()));
+            if (p.maxTempAt().isPresent()) {
+                sb.append(" (").append(esc(fmtClock(p.maxTempAt().get()))).append(")");
+            }
+            sb.append("<br>Pronóstico cercano: ").append(ForecastDaySnapshotLog.fmtTemp(closest.tempMax()));
+            sb.append(" (").append(esc(closest.logDayArt().format(LOG_DAY_SHORT))).append(")");
+            sb.append("<br>Pronóstico lejano: ").append(ForecastDaySnapshotLog.fmtTemp(farthest.tempMax()));
+            sb.append(" (").append(esc(farthest.logDayArt().format(LOG_DAY_SHORT))).append(")");
+            sb.append("</p>\n");
+        } else if (observed.isPresent()) {
+            MeasuresSummaryMessages.TempPeriod p = observed.get();
+            sb.append("<p><b>Observado (sin pronósticos históricos para comparar)</b><br>");
+            sb.append("Mín / máx temperatura: ")
                     .append(fmt(p.minTemp()))
                     .append(" / ")
                     .append(fmt(p.maxTemp()));
@@ -114,8 +141,30 @@ final class ForecastValidationMessages {
         sb.append("<b>").append(escTg(subject(dataDay))).append("</b>\n\n");
         sb.append(escTg(stationLabel)).append(" — ").append(escTg(dataDay.format(DAY))).append("\n\n");
 
-        sb.append("<b>Observado</b>\n");
-        if (observed.isPresent()) {
+        sb.append("<b>Comparación observado vs pronóstico</b>\n");
+        if (observed.isPresent() && !forecastSnapshots.isEmpty()) {
+            MeasuresSummaryMessages.TempPeriod p = observed.get();
+            ForecastDaySnapshotLog.SnapshotRow closest = forecastSnapshots.get(0);
+            ForecastDaySnapshotLog.SnapshotRow farthest = forecastSnapshots.get(forecastSnapshots.size() - 1);
+
+            sb.append("<b>Min</b> ").append(fmt(p.minTemp()));
+            if (p.minTempAt().isPresent()) {
+                sb.append(" (").append(escTg(fmtClock(p.minTempAt().get()))).append(")");
+            }
+            sb.append(" <b>Closest</b> ").append(ForecastDaySnapshotLog.fmtTemp(closest.tempMin()));
+            sb.append(" (").append(escTg(fmtShortDate(closest.logDayArt()))).append(")");
+            sb.append(" <b>Faraway</b> ").append(ForecastDaySnapshotLog.fmtTemp(farthest.tempMin()));
+            sb.append(" (").append(escTg(fmtShortDate(farthest.logDayArt()))).append(")\n");
+
+            sb.append("<b>Max</b> ").append(fmt(p.maxTemp()));
+            if (p.maxTempAt().isPresent()) {
+                sb.append(" (").append(escTg(fmtClock(p.maxTempAt().get()))).append(")");
+            }
+            sb.append(" <b>Closest</b> ").append(ForecastDaySnapshotLog.fmtTemp(closest.tempMax()));
+            sb.append(" (").append(escTg(fmtShortDate(closest.logDayArt()))).append(")");
+            sb.append(" <b>Faraway</b> ").append(ForecastDaySnapshotLog.fmtTemp(farthest.tempMax()));
+            sb.append(" (").append(escTg(fmtShortDate(farthest.logDayArt()))).append(")\n");
+        } else if (observed.isPresent()) {
             MeasuresSummaryMessages.TempPeriod p = observed.get();
             sb.append("Mín / máx: ")
                     .append(fmt(p.minTemp()))
@@ -166,15 +215,13 @@ final class ForecastValidationMessages {
             ForecastDaySnapshotLog.SnapshotRow f = forecasts.get(i);
             StringBuilder block = new StringBuilder();
             block.append(i + 1)
-                    .append(") día boletín ")
-                    .append(escTg(f.logDayArt().format(LOG_DAY_SHORT)))
-                    .append(" — ")
-                    .append(escTg(snapshotSmnHoraArt(f.smnUpdated(), f.writtenArt())));
-            block.append("\n   min/max ")
+                    .append(") ")
+                    .append(escTg(fmtShortDate(f.logDayArt())))
+                    .append(" ")
                     .append(ForecastDaySnapshotLog.fmtTemp(f.tempMin()))
-                    .append(" / ")
+                    .append("/")
                     .append(ForecastDaySnapshotLog.fmtTemp(f.tempMax()));
-            block.append(" · lluvia ≤").append(f.maxRainUpper()).append("%\n");
+            block.append(" lluvia ≤").append(f.maxRainUpper()).append("%\n");
             if (sb.length() + block.length() > TELEGRAM_BODY_BUDGET) {
                 break;
             }
@@ -216,6 +263,11 @@ final class ForecastValidationMessages {
 
     private static String fmtClock(ZonedDateTime z) {
         return z.withZoneSameInstant(ART).format(CLOCK);
+    }
+
+    /** Format date as "d/M" (e.g., "24/5") */
+    private static String fmtShortDate(LocalDate date) {
+        return date.getDayOfMonth() + "/" + date.getMonthValue();
     }
 
     private static String esc(String s) {
